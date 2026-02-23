@@ -2,10 +2,108 @@ const { Client, LocalAuth } = require('whatsapp-web.js')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
+const pendingSessions = new Set()
+const sessionLocks = new Map()
+const restartAttempts = new Map()
 const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
+
+const MAX_RESTART_ATTEMPTS = 3
+const RESTART_COOLDOWN_MS = 30000
+const RESTART_RESET_MS = 120000
+
+const acquireSessionLock = async (sessionId) => {
+  while (sessionLocks.get(sessionId)) {
+    await new Promise(resolve => setTimeout(resolve, 200))
+  }
+  sessionLocks.set(sessionId, true)
+}
+
+const releaseSessionLock = (sessionId) => {
+  sessionLocks.delete(sessionId)
+}
+
+const canRestart = (sessionId) => {
+  const now = Date.now()
+  const attempts = restartAttempts.get(sessionId)
+  if (!attempts) {
+    restartAttempts.set(sessionId, { count: 1, firstAttempt: now, lastAttempt: now })
+    return true
+  }
+  if (now - attempts.firstAttempt > RESTART_RESET_MS) {
+    restartAttempts.set(sessionId, { count: 1, firstAttempt: now, lastAttempt: now })
+    return true
+  }
+  if (attempts.count >= MAX_RESTART_ATTEMPTS) {
+    logger.error({ sessionId, attempts: attempts.count }, 'Max restart attempts reached, stopping recovery')
+    return false
+  }
+  if (now - attempts.lastAttempt < RESTART_COOLDOWN_MS) {
+    logger.warn({ sessionId }, 'Restart cooldown active, skipping recovery')
+    return false
+  }
+  attempts.count++
+  attempts.lastAttempt = now
+  return true
+}
+
+const killBrowserProcess = async (client, sessionId) => {
+  try {
+    if (client?.pupBrowser) {
+      const childProcess = client.pupBrowser.process()
+      if (childProcess) {
+        logger.info({ sessionId, pid: childProcess.pid }, 'Killing browser process via client reference')
+        childProcess.kill('SIGKILL')
+      }
+    }
+  } catch (e) {
+    logger.error({ sessionId, err: e }, 'Error killing browser process')
+  }
+}
+
+const killOrphanedBrowserByLockFile = async (sessionId) => {
+  try {
+    const singletonLockPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`, 'SingletonLock'))
+    const lockExists = await fs.promises.lstat(singletonLockPath).then(() => true).catch(() => false)
+    if (!lockExists) {
+      return false
+    }
+
+    let pid = null
+    try {
+      const linkTarget = await fs.promises.readlink(singletonLockPath)
+      const match = linkTarget.match(/-(\d+)$/)
+      if (match) {
+        pid = parseInt(match[1], 10)
+      }
+    } catch (e) {
+      // Not a symlink or unreadable
+    }
+
+    if (pid) {
+      try {
+        process.kill(pid, 0)
+        logger.info({ sessionId, pid }, 'Killing orphaned Chrome process found via lock file')
+        process.kill(pid, 'SIGKILL')
+        await new Promise(resolve => setTimeout(resolve, 1000))
+      } catch (e) {
+        if (e.code === 'ESRCH') {
+          logger.info({ sessionId, pid }, 'Lock file references dead process, cleaning up')
+        } else {
+          logger.error({ sessionId, pid, err: e }, 'Error killing orphaned process')
+        }
+      }
+    }
+
+    await fs.promises.unlink(singletonLockPath).catch(() => { })
+    return true
+  } catch (e) {
+    logger.error({ sessionId, err: e }, 'Error handling orphaned browser lock file')
+    return false
+  }
+}
 
 // Function to validate if the session is ready
 const validateSession = async (sessionId) => {
@@ -90,8 +188,15 @@ const setupSession = async (sessionId) => {
     if (sessions.has(sessionId)) {
       return { success: false, message: `Session already exists for: ${sessionId}`, client: sessions.get(sessionId) }
     }
+
+    if (pendingSessions.has(sessionId)) {
+      logger.warn({ sessionId }, 'Session initialization already in progress, skipping')
+      return { success: false, message: `Session initialization already in progress for: ${sessionId}`, client: null }
+    }
+
+    pendingSessions.add(sessionId)
     logger.info({ sessionId }, 'Session is being initiated')
-    // Disable the delete folder from the logout function (will be handled separately)
+
     const localAuth = new LocalAuth({ clientId: sessionId, dataPath: sessionFolderPath })
     delete localAuth.logout
     localAuth.logout = () => { }
@@ -166,18 +271,24 @@ const setupSession = async (sessionId) => {
     }
 
     const client = new Client(clientOptions)
+
     if (releaseBrowserLock) {
-      // See https://github.com/puppeteer/puppeteer/issues/4860
       const singletonLockPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`, 'SingletonLock'))
       const singletonLockExists = await fs.promises.lstat(singletonLockPath).then(() => true).catch(() => false)
       if (singletonLockExists) {
-        logger.warn({ sessionId }, 'Browser lock file exists, removing')
-        await fs.promises.unlink(singletonLockPath)
+        const isSessionActive = sessions.has(sessionId)
+        if (isSessionActive) {
+          logger.warn({ sessionId }, 'Browser lock exists but session is active, skipping lock removal')
+        } else {
+          logger.warn({ sessionId }, 'Browser lock file exists (stale), removing')
+          await fs.promises.unlink(singletonLockPath)
+        }
       }
     }
 
     try {
       client.once('ready', () => {
+        restartAttempts.delete(sessionId)
         patchWWebLibrary(client).catch((err) => {
           logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
         })
@@ -187,13 +298,16 @@ const setupSession = async (sessionId) => {
       await client.initialize()
     } catch (error) {
       logger.error({ sessionId, err: error }, 'Initialize error')
+      await killBrowserProcess(client, sessionId)
+      pendingSessions.delete(sessionId)
       throw error
     }
 
-    // Save the session to the Map
     sessions.set(sessionId, client)
+    pendingSessions.delete(sessionId)
     return { success: true, message: 'Session initiated successfully', client }
   } catch (error) {
+    pendingSessions.delete(sessionId)
     return { success: false, message: error.message, client: null }
   }
 }
@@ -204,20 +318,37 @@ const initializeEvents = (client, sessionId) => {
 
   if (recoverSessions) {
     waitForNestedObject(client, 'pupPage').then(() => {
-      const restartSession = async (sessionId) => {
-        sessions.delete(sessionId)
-        await client.destroy().catch(e => { })
-        await setupSession(sessionId)
+      const safeRestartSession = async (sessionId, reason) => {
+        if (!canRestart(sessionId)) {
+          logger.error({ sessionId, reason }, 'Recovery aborted: restart limit reached or cooldown active')
+          sessions.delete(sessionId)
+          pendingSessions.delete(sessionId)
+          await killBrowserProcess(client, sessionId)
+          return
+        }
+
+        await acquireSessionLock(sessionId)
+        try {
+          sessions.delete(sessionId)
+          pendingSessions.delete(sessionId)
+          await client.destroy().catch(() => { })
+          await killBrowserProcess(client, sessionId)
+          await new Promise(resolve => setTimeout(resolve, 2000))
+          await setupSession(sessionId)
+        } catch (e) {
+          logger.error({ sessionId, err: e }, 'Recovery failed')
+        } finally {
+          releaseSessionLock(sessionId)
+        }
       }
+
       client.pupPage.once('close', function () {
-        // emitted when the page closes
         logger.warn({ sessionId }, 'Browser page closed. Restoring')
-        restartSession(sessionId)
+        safeRestartSession(sessionId, 'page_closed')
       })
       client.pupPage.once('error', function () {
-        // emitted when the page crashes
         logger.warn({ sessionId }, 'Error occurred on browser page. Restoring')
-        restartSession(sessionId)
+        safeRestartSession(sessionId, 'page_error')
       })
       client.pupPage
         .on('console', message => {
@@ -475,6 +606,7 @@ const deleteSessionFolder = async (sessionId) => {
 
 // Function to reload client session without removing browser cache
 const reloadSession = async (sessionId) => {
+  await acquireSessionLock(sessionId)
   try {
     const client = sessions.get(sessionId)
     if (!client) {
@@ -490,23 +622,27 @@ const reloadSession = async (sessionId) => {
         new Promise(resolve => setTimeout(resolve, 5000))
       ])
     } catch (e) {
-      const childProcess = client.pupBrowser.process()
-      if (childProcess) {
-        childProcess.kill(9)
-      }
+      await killBrowserProcess(client, sessionId)
     }
     sessions.delete(sessionId)
+    pendingSessions.delete(sessionId)
     await setupSession(sessionId)
   } catch (error) {
     logger.error({ sessionId, err: error }, 'Failed to reload session')
     throw error
+  } finally {
+    releaseSessionLock(sessionId)
   }
 }
 
 const destroySession = async (sessionId) => {
+  await acquireSessionLock(sessionId)
   try {
     const client = sessions.get(sessionId)
     if (!client) {
+      logger.info({ sessionId }, 'No client in memory, checking for orphaned browser process')
+      await killOrphanedBrowserByLockFile(sessionId)
+      pendingSessions.delete(sessionId)
       return
     }
     client.pupPage?.removeAllListeners('close')
@@ -516,24 +652,39 @@ const destroySession = async (sessionId) => {
     } catch (error) {
       logger.error({ sessionId, err: error }, 'Failed to terminate WebSocket server')
     }
-    await client.destroy()
-    // Wait 10 secs for client.pupBrowser to be disconnected
+    try {
+      await client.destroy()
+    } catch (e) {
+      logger.warn({ sessionId, err: e }, 'Graceful destroy failed, force killing')
+    }
     let maxDelay = 0
     while (client.pupBrowser?.isConnected() && (maxDelay < 10)) {
       await new Promise(resolve => setTimeout(resolve, 1000))
       maxDelay++
     }
+    if (client.pupBrowser?.isConnected()) {
+      await killBrowserProcess(client, sessionId)
+    }
     sessions.delete(sessionId)
+    pendingSessions.delete(sessionId)
+    restartAttempts.delete(sessionId)
   } catch (error) {
     logger.error({ sessionId, err: error }, 'Failed to stop session')
     throw error
+  } finally {
+    releaseSessionLock(sessionId)
   }
 }
 
 const deleteSession = async (sessionId, validation) => {
+  await acquireSessionLock(sessionId)
   try {
     const client = sessions.get(sessionId)
     if (!client) {
+      logger.info({ sessionId }, 'No client in memory, checking for orphaned browser process')
+      await killOrphanedBrowserByLockFile(sessionId)
+      pendingSessions.delete(sessionId)
+      await deleteSessionFolder(sessionId).catch(() => { })
       return
     }
     client.pupPage?.removeAllListeners('close')
@@ -543,46 +694,61 @@ const deleteSession = async (sessionId, validation) => {
     } catch (error) {
       logger.error({ sessionId, err: error }, 'Failed to terminate WebSocket server')
     }
-    if (validation.success) {
-      // Client Connected, request logout
-      logger.info({ sessionId }, 'Logging out session')
-      await client.logout()
-    } else if (validation.message === 'session_not_connected') {
-      // Client not Connected, request destroy
-      logger.info({ sessionId }, 'Destroying session')
-      await client.destroy()
+    try {
+      if (validation.success) {
+        logger.info({ sessionId }, 'Logging out session')
+        await client.logout()
+      } else if (validation.message === 'session_not_connected') {
+        logger.info({ sessionId }, 'Destroying session')
+        await client.destroy()
+      }
+    } catch (e) {
+      logger.warn({ sessionId, err: e }, 'Graceful shutdown failed, force killing')
     }
-    // Wait 10 secs for client.pupBrowser to be disconnected before deleting the folder
     let maxDelay = 0
-    while (client.pupBrowser.isConnected() && (maxDelay < 10)) {
+    while (client.pupBrowser?.isConnected() && (maxDelay < 10)) {
       await new Promise(resolve => setTimeout(resolve, 1000))
       maxDelay++
     }
+    if (client.pupBrowser?.isConnected()) {
+      await killBrowserProcess(client, sessionId)
+    }
     sessions.delete(sessionId)
+    pendingSessions.delete(sessionId)
+    restartAttempts.delete(sessionId)
     await deleteSessionFolder(sessionId)
   } catch (error) {
     logger.error({ sessionId, err: error }, 'Failed to delete session')
     throw error
+  } finally {
+    releaseSessionLock(sessionId)
   }
 }
 
 // Function to handle session flush
 const flushSessions = async (deleteOnlyInactive) => {
   try {
-    // Read the contents of the sessions folder
     const files = await fs.promises.readdir(sessionFolderPath)
-    // Iterate through the files in the parent folder
+    let flushedCount = 0
+    let skippedCount = 0
+
     for (const file of files) {
-      // Use regular expression to extract the string from the folder name
       const match = file.match(/^session-(.+)$/)
       if (match) {
         const sessionId = match[1]
         const validation = await validateSession(sessionId)
+
         if (!deleteOnlyInactive || !validation.success) {
+          logger.info({ sessionId, validation: validation.message }, 'Flushing session')
           await deleteSession(sessionId, validation)
+          flushedCount++
+        } else {
+          skippedCount++
         }
       }
     }
+
+    logger.info({ flushedCount, skippedCount }, 'Session flush completed')
   } catch (error) {
     logger.error(error, 'Failed to flush sessions')
     throw error
