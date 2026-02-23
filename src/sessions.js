@@ -63,6 +63,30 @@ const killBrowserProcess = async (client, sessionId) => {
   }
 }
 
+const getActiveBrowserPids = () => {
+  const pids = new Set()
+  for (const [, client] of sessions) {
+    try {
+      const proc = client?.pupBrowser?.process()
+      if (proc?.pid) {
+        pids.add(proc.pid)
+      }
+    } catch (e) { /* ignore */ }
+  }
+  return pids
+}
+
+const isProcessChrome = async (pid, sessionId) => {
+  try {
+    const cmdline = await fs.promises.readFile(`/proc/${pid}/cmdline`, 'utf8')
+    const isChrome = cmdline.includes('chrome') || cmdline.includes('chromium')
+    const belongsToSession = cmdline.includes(`session-${sessionId}`)
+    return isChrome && belongsToSession
+  } catch (e) {
+    return false
+  }
+}
+
 const killOrphanedBrowserByLockFile = async (sessionId) => {
   try {
     const singletonLockPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`, 'SingletonLock'))
@@ -83,9 +107,22 @@ const killOrphanedBrowserByLockFile = async (sessionId) => {
     }
 
     if (pid) {
+      const activePids = getActiveBrowserPids()
+      if (activePids.has(pid)) {
+        logger.warn({ sessionId, pid }, 'Lock file PID belongs to an active session, skipping kill (PID reuse)')
+        await fs.promises.unlink(singletonLockPath).catch(() => { })
+        return true
+      }
+
+      const confirmed = await isProcessChrome(pid, sessionId)
+      if (!confirmed) {
+        logger.warn({ sessionId, pid }, 'Lock file PID is not a Chrome process for this session, skipping kill')
+        await fs.promises.unlink(singletonLockPath).catch(() => { })
+        return true
+      }
+
       try {
-        process.kill(pid, 0)
-        logger.info({ sessionId, pid }, 'Killing orphaned Chrome process found via lock file')
+        logger.info({ sessionId, pid }, 'Killing confirmed orphaned Chrome process')
         process.kill(pid, 'SIGKILL')
         await new Promise(resolve => setTimeout(resolve, 1000))
       } catch (e) {
@@ -731,24 +768,43 @@ const flushSessions = async (deleteOnlyInactive) => {
     const files = await fs.promises.readdir(sessionFolderPath)
     let flushedCount = 0
     let skippedCount = 0
+    let orphanedCount = 0
 
     for (const file of files) {
       const match = file.match(/^session-(.+)$/)
-      if (match) {
-        const sessionId = match[1]
-        const validation = await validateSession(sessionId)
+      if (!match) continue
 
-        if (!deleteOnlyInactive || !validation.success) {
-          logger.info({ sessionId, validation: validation.message }, 'Flushing session')
-          await deleteSession(sessionId, validation)
-          flushedCount++
-        } else {
-          skippedCount++
+      const sessionId = match[1]
+      const hasClientInMap = sessions.has(sessionId)
+
+      if (deleteOnlyInactive) {
+        if (!hasClientInMap) {
+          logger.info({ sessionId }, 'Cleaning up orphaned session (no client in memory)')
+          await killOrphanedBrowserByLockFile(sessionId)
+          await deleteSessionFolder(sessionId).catch(() => { })
+          orphanedCount++
+          continue
         }
+
+        const validation = await validateSession(sessionId)
+        if (validation.success) {
+          logger.debug({ sessionId }, 'Session is active, skipping')
+          skippedCount++
+          continue
+        }
+
+        logger.info({ sessionId, state: validation.message }, 'Flushing inactive session')
+        await deleteSession(sessionId, validation)
+        flushedCount++
+      } else {
+        const validation = await validateSession(sessionId)
+        logger.info({ sessionId, validation: validation.message }, 'Flushing session (terminate all)')
+        await deleteSession(sessionId, validation)
+        flushedCount++
       }
     }
 
-    logger.info({ flushedCount, skippedCount }, 'Session flush completed')
+    logger.info({ flushedCount, skippedCount, orphanedCount }, 'Session flush completed')
   } catch (error) {
     logger.error(error, 'Failed to flush sessions')
     throw error

@@ -77,10 +77,30 @@ A rota `GET /session/terminateInactive` retornava `"Flush completed successfully
 - `deleteSession` e `destroySession` agora chamam essa função quando não encontram client no Map, ao invés de retornar silenciosamente
 - `flushSessions` agora loga contagem de sessões encerradas vs mantidas
 
+## Correção 3: `terminateInactive` matava sessões conectadas
+
+### Problema
+Ao rodar `terminateInactive`, sessões que estavam conectadas também eram derrubadas. Duas causas:
+
+1. **PID reutilizado pelo SO (Linux):** A função `killOrphanedBrowserByLockFile` lia o PID do `SingletonLock` de uma sessão órfã. Mas o Linux recicla PIDs. Se o PID antigo agora pertencia ao Chrome de uma sessão ATIVA, ela era morta por engano.
+
+2. **`flushSessions` tratava igual sessões órfãs e sessões no Map:** Ambas passavam por `validateSession` → `deleteSession`, mas `validateSession` pode falhar temporariamente para sessões ocupadas (timeout no `getState()`), causando destruição indevida.
+
+### Correção
+- `killOrphanedBrowserByLockFile` agora faz **3 verificações** antes de matar:
+  1. Verifica se o PID pertence a uma sessão ativa no Map (`getActiveBrowserPids`)
+  2. Lê `/proc/PID/cmdline` para confirmar que é Chrome
+  3. Verifica se o cmdline contém o caminho da sessão específica
+- `flushSessions(deleteOnlyInactive=true)` agora separa claramente:
+  - **Sessões órfãs** (pasta existe, sem client no Map): limpa lock file e pasta
+  - **Sessões no Map não conectadas**: destrói via referência do client (seguro)
+  - **Sessões no Map conectadas**: pula sem tocar
+
 ## Impacto
 
 - Elimina criação infinita de processos Chrome
-- Rota `terminateInactive` agora realmente mata processos Chrome órfãos
+- Rota `terminateInactive` mata SOMENTE processos Chrome genuinamente órfãos
+- Sessões conectadas nunca são afetadas pelo flush
 - Servidor mantém uso estável de memória e CPU
 - Sessões se recuperam de forma controlada (máximo 3 tentativas)
 - Operações concorrentes na mesma sessão são serializadas
