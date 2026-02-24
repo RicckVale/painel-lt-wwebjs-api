@@ -57,11 +57,32 @@ Nenhum mecanismo de lock impedia operações concorrentes (start, stop, restart)
 - Agora verifica se a sessão está ativa antes de remover o `SingletonLock`
 - Só remove se a sessão não existir no Map (lock realmente stale)
 
+## Correção 4: PM2 restart não matava processos Chrome
+
+### Problema
+O PM2 reiniciava a aplicação diariamente às 00h, mas ao matar o processo Node.js, os processos Chrome spawned pelo Puppeteer ficavam órfãos. A cada restart, mais Chromes acumulavam porque não havia handler de shutdown.
+
+### Correção
+Adicionado `gracefulShutdown` em `server.js` que intercepta `SIGTERM` e `SIGINT`:
+1. Para o servidor HTTP
+2. Itera sobre todas as sessões ativas no Map
+3. Chama `client.destroy()` em paralelo para cada sessão
+4. Se o destroy graceful falhar, faz `SIGKILL` no processo Chrome
+5. Timeout de segurança de 30s — se não conseguir fechar tudo, force-kill em todos e `process.exit(1)`
+
+### Logs esperados no restart
+```
+{"msg":"Shutdown signal received, closing all browser sessions...","signal":"SIGTERM"}
+{"msg":"Session closed gracefully","sessionId":"xxx"}
+{"msg":"All 3 sessions closed. Exiting."}
+```
+
 ## Arquivos Modificados
 
 | Arquivo | Alteração |
 |---------|-----------|
-| `src/sessions.js` | Todas as correções acima |
+| `src/sessions.js` | Controle de concorrência, cleanup, proteção de sessões ativas |
+| `server.js` | Graceful shutdown handler para SIGTERM/SIGINT |
 
 ## Correção Adicional: Rota `terminateInactive` não matava processos órfãos
 

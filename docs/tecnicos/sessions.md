@@ -58,6 +58,16 @@ Página fecha/erro
             → Não: abort, kill processo, limpa estado
 ```
 
+## Graceful Shutdown (server.js)
+
+O `server.js` intercepta `SIGTERM` e `SIGINT` (enviados pelo PM2 no restart) e:
+1. Para o servidor HTTP
+2. Destrói todas as sessões em paralelo via `client.destroy()`
+3. Se falhar, faz `SIGKILL` direto no processo Chrome
+4. Timeout de 30s como safety net — force-kill em tudo e `process.exit(1)`
+
+Isso garante que nenhum Chrome fique órfão quando o PM2 reinicia a aplicação.
+
 ## Histórico de Modificações Recentes
 
-- Para detalhes sobre a correção de sessões Chrome infinitas, veja: `../23022026_fix_sessoes_chrome_infinitas.md`
+- Para detalhes sobre a correção de sessões Chrome infinitas e graceful shutdown, veja: `../23022026_fix_sessoes_chrome_infinitas.md`
