@@ -150,21 +150,32 @@ const patchWWebLibrary = async (client) => {
         // window.Store was removed in some WhatsApp Web versions; try Store first, then require()
         let chatSource = window.Store?.Chat
         let sourceLabel = 'Store.Chat'
+        const tried = []
+
         if (!chatSource?.getModelsArray && typeof window.require === 'function') {
-          try {
-            chatSource = window.require('WAWebChat')
-            if (chatSource?.getModelsArray) sourceLabel = 'require(WAWebChat)'
-          } catch (e) {
-            if (typeof console !== 'undefined') console.warn('[getChats] require(WAWebChat) failed', e?.message)
-          }
-          if (!chatSource?.getModelsArray) {
+          const req = window.require
+          const tryModule = (name, getChatFrom) => {
             try {
-              chatSource = window.require('WebChat')
-              if (chatSource?.getModelsArray) sourceLabel = 'require(WebChat)'
+              const mod = req(name)
+              if (!mod) { tried.push(name + '=null'); return null }
+              const candidate = getChatFrom ? getChatFrom(mod) : mod
+              if (candidate?.getModelsArray) {
+                chatSource = candidate
+                sourceLabel = getChatFrom ? 'require(' + name + ').Chat' : 'require(' + name + ')'
+                return true
+              }
+              tried.push(name + '(no getModelsArray)')
+              return null
             } catch (e) {
-              if (typeof console !== 'undefined') console.warn('[getChats] require(WebChat) failed', e?.message)
+              tried.push(name + ':' + (e?.message || 'err'))
+              return null
             }
           }
+          tryModule('WAWebChat') || tryModule('WebChat') ||
+          tryModule('WAWebCollections', m => m?.Chat) ||
+          tryModule('WAWebChatCollection') ||
+          tryModule('DefaultChatCollection') ||
+          tryModule('ChatCollection')
         }
 
         if (!chatSource || typeof chatSource.getModelsArray !== 'function') {
@@ -172,8 +183,8 @@ const patchWWebLibrary = async (client) => {
             '[getChats] chatSource unavailable: hasStore=' + !!window.Store +
             ' hasStoreChat=' + !!window.Store?.Chat +
             ' hasRequire=' + (typeof window.require === 'function') +
-            ' chatSourceType=' + (chatSource == null ? 'null' : typeof chatSource) +
-            ' hasGetModelsArray=' + !!(chatSource?.getModelsArray)
+            ' tried=' + (tried.length ? tried.join(',') : 'none') +
+            ' chatSourceType=' + (chatSource == null ? 'null' : typeof chatSource)
           )
         }
 
