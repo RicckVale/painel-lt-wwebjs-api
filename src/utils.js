@@ -81,9 +81,13 @@ const patchWWebLibrary = async (client) => {
   logger.debug('patchWWebLibrary: patching Client.prototype.getChats and WWebJS.getChats')
   Client.prototype.getChats = async function (searchOptions = {}) {
     logger.debug({ searchOptions }, 'getChats: calling pupPage.evaluate(WWebJS.getChats)')
-    const chats = await this.pupPage.evaluate(async (searchOptions) => {
+    const result = await this.pupPage.evaluate(async (searchOptions) => {
       return await window.WWebJS.getChats({ ...searchOptions })
     }, searchOptions)
+    const chats = Array.isArray(result) ? result : (result?.chats ?? [])
+    if (result?._wwebjsSource) {
+      logger.info({ getChatsSource: result._wwebjsSource, count: chats.length }, 'getChats: source used')
+    }
     logger.debug({ count: chats?.length }, 'getChats: evaluate returned, mapping ChatFactory')
     return chats.map(chat => ChatFactory.create(this, chat))
   }
@@ -193,9 +197,10 @@ const patchWWebLibrary = async (client) => {
 
         if (typeof console !== 'undefined') console.log('[getChats] source=' + sourceLabel + ' total=' + (allChats?.length ?? 0) + ' filtered=' + (filteredChats?.length ?? 0))
 
-        return await Promise.all(
+        const chats = await Promise.all(
           filteredChats.map(chat => window.WWebJS.getChatModel(chat))
         )
+        return { chats, _wwebjsSource: sourceLabel }
       } catch (e) {
         if (typeof console !== 'undefined') console.error('[getChats]', e?.message, e?.stack)
         throw e
