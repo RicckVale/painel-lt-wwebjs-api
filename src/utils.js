@@ -139,9 +139,8 @@ const patchWWebLibrary = async (client) => {
         }
         return true
       }
-
-      const allChats = window.Store.Chat.getModelsArray()
-
+    // window.Store was removed from WhatsApp Web; use require() (Fix API change window.store removal #117)
+      const allChats = (window.require('WAWebChat')).getModelsArray()
       const filteredChats = allChats.filter(chatFilter)
 
       return await Promise.all(
