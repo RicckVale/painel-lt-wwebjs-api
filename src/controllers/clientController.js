@@ -1,6 +1,7 @@
 const { MessageMedia, Location, Poll } = require('whatsapp-web.js')
 const { sessions } = require('../sessions')
 const { sendErrorResponse } = require('../utils')
+const { logger } = require('../logger')
 
 /**
  * Send a message to a chat using the WhatsApp API
@@ -361,9 +362,12 @@ const getChats = async (req, res) => {
   */
   try {
     const client = sessions.get(req.params.sessionId)
+    logger.debug({ sessionId: req.params.sessionId }, 'getChats: calling client.getChats()')
     const chats = await client.getChats()
+    logger.debug({ sessionId: req.params.sessionId, count: chats?.length }, 'getChats: ok')
     res.json({ success: true, chats })
   } catch (error) {
+    logger.error({ sessionId: req.params.sessionId, err: error, message: error.message, stack: error.stack }, 'getChats: failed')
     sendErrorResponse(res, 500, error.message)
   }
 }
@@ -420,9 +424,12 @@ const getChatsWithSearch = async (req, res) => {
   try {
     const { searchOptions = {} } = req.body
     const client = sessions.get(req.params.sessionId)
+    logger.debug({ sessionId: req.params.sessionId, searchOptions }, 'getChatsWithSearch: calling client.getChats()')
     const chats = await client.getChats(searchOptions)
+    logger.debug({ sessionId: req.params.sessionId, count: chats?.length }, 'getChatsWithSearch: ok')
     res.json({ success: true, chats })
   } catch (error) {
+    logger.error({ sessionId: req.params.sessionId, err: error, message: error.message, stack: error.stack }, 'getChatsWithSearch: failed')
     sendErrorResponse(res, 500, error.message)
   }
 }

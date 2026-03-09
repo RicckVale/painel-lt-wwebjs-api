@@ -78,11 +78,13 @@ const exposeFunctionIfAbsent = async (page, name, fn) => {
 
 const patchWWebLibrary = async (client) => {
   // MUST be run after the 'ready' event fired
+  logger.debug('patchWWebLibrary: patching Client.prototype.getChats and WWebJS.getChats')
   Client.prototype.getChats = async function (searchOptions = {}) {
+    logger.debug({ searchOptions }, 'getChats: calling pupPage.evaluate(WWebJS.getChats)')
     const chats = await this.pupPage.evaluate(async (searchOptions) => {
       return await window.WWebJS.getChats({ ...searchOptions })
     }, searchOptions)
-
+    logger.debug({ count: chats?.length }, 'getChats: evaluate returned, mapping ChatFactory')
     return chats.map(chat => ChatFactory.create(this, chat))
   }
 
@@ -107,9 +109,13 @@ const patchWWebLibrary = async (client) => {
       const chat = await window.WWebJS.getChat(chatId, { getAsModel: false })
       let msgs = chat.msgs.getModelsArray().filter(msgFilter)
 
+      let loadEarlierModule = null
+      if (typeof window.require === 'function') {
+        try { loadEarlierModule = window.require('WAWebChatLoadMessages') || window.require('WebChatLoadMessages') } catch (_) {}
+      }
       if (searchOptions && searchOptions.limit > 0) {
         while (msgs.length < searchOptions.limit) {
-          const loadedMessages = await (window.require('WAWebChatLoadMessages')).loadEarlierMsgs(chat);
+          const loadedMessages = loadEarlierModule ? await loadEarlierModule.loadEarlierMsgs(chat) : []
 
           if (!loadedMessages || !loadedMessages.length) break
           msgs = [...loadedMessages.filter(msgFilter), ...msgs]
@@ -130,24 +136,62 @@ const patchWWebLibrary = async (client) => {
   await client.pupPage.evaluate(() => {
     // hotfix for https://github.com/pedroslopez/whatsapp-web.js/pull/3643
     window.WWebJS.getChats = async (searchOptions = {}) => {
-      const chatFilter = (c) => {
-        if (searchOptions && searchOptions.unread === true && c.unreadCount === 0) {
-          return false
+      try {
+        const chatFilter = (c) => {
+          if (searchOptions && searchOptions.unread === true && c.unreadCount === 0) {
+            return false
+          }
+          if (searchOptions && searchOptions.since !== undefined && Number.isFinite(searchOptions.since) && c.t < searchOptions.since) {
+            return false
+          }
+          return true
         }
-        if (searchOptions && searchOptions.since !== undefined && Number.isFinite(searchOptions.since) && c.t < searchOptions.since) {
-          return false
-        }
-        return true
-      }
-    // window.Store was removed from WhatsApp Web; use require() (Fix API change window.store removal #117)
-      const allChats = (window.require('WAWebChat')).getModelsArray()
-      const filteredChats = allChats.filter(chatFilter)
 
-      return await Promise.all(
-        filteredChats.map(chat => window.WWebJS.getChatModel(chat))
-      )
+        // window.Store was removed in some WhatsApp Web versions; try Store first, then require()
+        let chatSource = window.Store?.Chat
+        let sourceLabel = 'Store.Chat'
+        if (!chatSource?.getModelsArray && typeof window.require === 'function') {
+          try {
+            chatSource = window.require('WAWebChat')
+            if (chatSource?.getModelsArray) sourceLabel = 'require(WAWebChat)'
+          } catch (e) {
+            if (typeof console !== 'undefined') console.warn('[getChats] require(WAWebChat) failed', e?.message)
+          }
+          if (!chatSource?.getModelsArray) {
+            try {
+              chatSource = window.require('WebChat')
+              if (chatSource?.getModelsArray) sourceLabel = 'require(WebChat)'
+            } catch (e) {
+              if (typeof console !== 'undefined') console.warn('[getChats] require(WebChat) failed', e?.message)
+            }
+          }
+        }
+
+        if (!chatSource || typeof chatSource.getModelsArray !== 'function') {
+          throw new Error(
+            '[getChats] chatSource unavailable: hasStore=' + !!window.Store +
+            ' hasStoreChat=' + !!window.Store?.Chat +
+            ' hasRequire=' + (typeof window.require === 'function') +
+            ' chatSourceType=' + (chatSource == null ? 'null' : typeof chatSource) +
+            ' hasGetModelsArray=' + !!(chatSource?.getModelsArray)
+          )
+        }
+
+        const allChats = chatSource.getModelsArray()
+        const filteredChats = allChats.filter(chatFilter)
+
+        if (typeof console !== 'undefined') console.log('[getChats] source=' + sourceLabel + ' total=' + (allChats?.length ?? 0) + ' filtered=' + (filteredChats?.length ?? 0))
+
+        return await Promise.all(
+          filteredChats.map(chat => window.WWebJS.getChatModel(chat))
+        )
+      } catch (e) {
+        if (typeof console !== 'undefined') console.error('[getChats]', e?.message, e?.stack)
+        throw e
+      }
     }
   })
+  logger.debug('patchWWebLibrary: WWebJS.getChats patch applied')
 }
 
 module.exports = {
