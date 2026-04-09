@@ -1,9 +1,12 @@
 // Load environment variables from .env file
+const path = require('path')
+const crypto = require('crypto')
 require('dotenv').config({ path: process.env.ENV_PATH || '.env' })
 
 // setup global const
 const servicePort = process.env.PORT || 3000
 const sessionFolderPath = process.env.SESSIONS_PATH || './sessions'
+const resolvedSessionsPath = path.resolve(sessionFolderPath)
 const enableLocalCallbackExample = (process.env.ENABLE_LOCAL_CALLBACK_EXAMPLE || '').toLowerCase() === 'true'
 const globalApiKey = process.env.API_KEY
 const baseWebhookURL = process.env.BASE_WEBHOOK_URL
@@ -31,10 +34,17 @@ const clientInitializeRetryBaseMs = Math.max(200, parseInt(process.env.CLIENT_IN
 const puppeteerProtocolTimeoutMs = Math.max(0, parseInt(process.env.PUPPETEER_PROTOCOL_TIMEOUT_MS || '300000', 10))
 // Padrão true: após esgotar retentativas, apaga session-<id> e tenta initialize uma vez do zero (novo QR se necessário). Defina false para desativar
 const wipeSessionDataAfterInitFailure = (process.env.WIPE_SESSION_DATA_AFTER_INIT_FAILURE || 'true').toLowerCase() === 'true'
+// Identifica processos Chrome lançados por esta API (flag + pasta user-data-dir); permitir override por instância/tenant no mesmo host
+const rawWwebjsBrowserMarker = (process.env.WWEBJS_BROWSER_MARKER || '').trim()
+const wwebjsBrowserMarker = /^[a-zA-Z0-9_-]{4,128}$/.test(rawWwebjsBrowserMarker)
+  ? rawWwebjsBrowserMarker
+  : crypto.createHash('sha256').update(resolvedSessionsPath).digest('hex').slice(0, 24)
+const cleanupOrphanBrowsersOnStartup = (process.env.CLEANUP_ORPHAN_BROWSERS_ON_STARTUP || 'true').toLowerCase() === 'true'
 
 module.exports = {
   servicePort,
   sessionFolderPath,
+  resolvedSessionsPath,
   enableLocalCallbackExample,
   globalApiKey,
   baseWebhookURL,
@@ -59,5 +69,7 @@ module.exports = {
   clientInitializeMaxRetries,
   clientInitializeRetryBaseMs,
   puppeteerProtocolTimeoutMs,
-  wipeSessionDataAfterInitFailure
+  wipeSessionDataAfterInitFailure,
+  wwebjsBrowserMarker,
+  cleanupOrphanBrowsersOnStartup
 }

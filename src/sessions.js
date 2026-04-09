@@ -2,7 +2,7 @@ const { Client, LocalAuth } = require('whatsapp-web.js')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, clientInitializeMaxRetries, clientInitializeRetryBaseMs, puppeteerProtocolTimeoutMs, wipeSessionDataAfterInitFailure } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, clientInitializeMaxRetries, clientInitializeRetryBaseMs, puppeteerProtocolTimeoutMs, wipeSessionDataAfterInitFailure, wwebjsBrowserMarker } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 
 const isTransientPuppeteerInitializeError = (err) => {
@@ -128,8 +128,10 @@ const setupSession = async (sessionId, setupOptions = {}) => {
       puppeteer: {
         executablePath: chromeBin,
         headless,
+        userDataDir: path.resolve(sessionFolderPath, '.chrome-profiles', sessionId),
         ...(puppeteerProtocolTimeoutMs > 0 ? { protocolTimeout: puppeteerProtocolTimeoutMs } : {}),
         args: [
+          `--wwebjs-app-marker=${wwebjsBrowserMarker}`,
           '--autoplay-policy=user-gesture-required',
           '--disable-background-networking',
           '--disable-background-timer-throttling',
@@ -574,6 +576,17 @@ const reloadSession = async (sessionId) => {
   }
 }
 
+const destroyAllSessions = async () => {
+  const ids = [...sessions.keys()]
+  for (const id of ids) {
+    try {
+      await destroySession(id)
+    } catch (err) {
+      logger.error({ sessionId: id, err }, 'destroyAllSessions: falha ao parar uma sessão')
+    }
+  }
+}
+
 const destroySession = async (sessionId) => {
   try {
     const client = sessions.get(sessionId)
@@ -668,5 +681,6 @@ module.exports = {
   deleteSession,
   reloadSession,
   flushSessions,
-  destroySession
+  destroySession,
+  destroyAllSessions
 }
