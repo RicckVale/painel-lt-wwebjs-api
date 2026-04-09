@@ -2,17 +2,21 @@ const { Client, LocalAuth } = require('whatsapp-web.js')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, clientInitializeMaxRetries, clientInitializeRetryBaseMs } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, clientInitializeMaxRetries, clientInitializeRetryBaseMs, puppeteerProtocolTimeoutMs, wipeSessionDataAfterInitFailure } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
 
 const isTransientPuppeteerInitializeError = (err) => {
   const msg = err && err.message ? err.message : String(err)
+  const name = err && err.name ? err.name : ''
   return (
+    name === 'ProtocolError' ||
     msg.includes('Execution context was destroyed') ||
     msg.includes('Target closed') ||
     msg.includes('Session closed') ||
     msg.includes('Frame was detached') ||
-    msg.includes('Navigation timeout')
+    msg.includes('Navigation timeout') ||
+    msg.includes('Runtime.callFunctionOn timed out') ||
+    msg.includes('protocolTimeout')
   )
 }
 const { logger } = require('./logger')
@@ -95,13 +99,26 @@ const restoreSessions = () => {
   }
 }
 
+// Remove apenas a pasta LocalAuth (session-<id>) sem passar pelo fluxo de logout API
+const wipeSessionAuthData = async (sessionId) => {
+  const resolvedBase = path.resolve(sessionFolderPath)
+  const targetDirPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`))
+  const basePrefix = resolvedBase.endsWith(path.sep) ? resolvedBase : `${resolvedBase}${path.sep}`
+  if (!targetDirPath.startsWith(basePrefix)) {
+    throw new Error('Invalid path: Directory traversal detected')
+  }
+  await fs.promises.rm(targetDirPath, { recursive: true, force: true })
+  logger.warn({ sessionId }, 'Dados locais da sessão removidos (pasta session-<id>)')
+}
+
 // Setup Session
-const setupSession = async (sessionId) => {
+const setupSession = async (sessionId, setupOptions = {}) => {
+  const resetDataRetryExhausted = setupOptions.resetDataRetryExhausted === true
   try {
     if (sessions.has(sessionId)) {
       return { success: false, message: `Session already exists for: ${sessionId}`, client: sessions.get(sessionId) }
     }
-    logger.info({ sessionId }, 'Session is being initiated')
+    logger.info({ sessionId, resetDataRetryExhausted }, 'Session is being initiated')
     // Disable the delete folder from the logout function (will be handled separately)
     const localAuth = new LocalAuth({ clientId: sessionId, dataPath: sessionFolderPath })
     delete localAuth.logout
@@ -111,6 +128,7 @@ const setupSession = async (sessionId) => {
       puppeteer: {
         executablePath: chromeBin,
         headless,
+        ...(puppeteerProtocolTimeoutMs > 0 ? { protocolTimeout: puppeteerProtocolTimeoutMs } : {}),
         args: [
           '--autoplay-policy=user-gesture-required',
           '--disable-background-networking',
@@ -177,6 +195,7 @@ const setupSession = async (sessionId) => {
     }
 
     let client = null
+    let lastError = null
     for (let attempt = 1; attempt <= clientInitializeMaxRetries; attempt++) {
       client = new Client(clientOptions)
       if (releaseBrowserLock) {
@@ -202,8 +221,15 @@ const setupSession = async (sessionId) => {
           logger.info({ sessionId, attempt }, 'Sessão iniciada após retentativa de initialize')
         }
         sessions.set(sessionId, client)
-        return { success: true, message: 'Session initiated successfully', client }
+        attachRecoverSessionPageRecoveryListeners(client, sessionId)
+        const payload = { success: true, message: 'Session initiated successfully', client }
+        if (resetDataRetryExhausted) {
+          payload.sessionDataReset = true
+          payload.message = 'Session initiated successfully after clearing local session data (scan QR again if required)'
+        }
+        return payload
       } catch (error) {
+        lastError = error
         logger.error({ sessionId, err: error, attempt, maxAttempts: clientInitializeMaxRetries }, 'Initialize error')
         await client.destroy().catch(() => {})
         const canRetry = attempt < clientInitializeMaxRetries && isTransientPuppeteerInitializeError(error)
@@ -213,12 +239,49 @@ const setupSession = async (sessionId) => {
           await sleep(delayMs)
           continue
         }
-        throw error
+        break
       }
     }
+
+    if (lastError && wipeSessionDataAfterInitFailure && !resetDataRetryExhausted) {
+      logger.warn({ sessionId }, 'Falha ao inicializar com dados atuais; removendo auth local e repetindo uma vez do zero')
+      try {
+        await wipeSessionAuthData(sessionId)
+      } catch (wipeErr) {
+        logger.error({ sessionId, err: wipeErr }, 'Não foi possível remover a pasta da sessão antes do retry')
+      }
+      const retryResult = await setupSession(sessionId, { resetDataRetryExhausted: true })
+      if (retryResult.success) {
+        return retryResult
+      }
+      return { success: false, message: retryResult.message || (lastError && lastError.message) || 'session init failed', client: null }
+    }
+
+    return { success: false, message: lastError ? lastError.message : 'session init failed', client: null }
   } catch (error) {
     return { success: false, message: error.message, client: null }
   }
+}
+
+// close/error durante inject/initialize disparavam restartSession e abortavam o loop de retentativas (sempre attempt 1 nos logs)
+const attachRecoverSessionPageRecoveryListeners = (client, sessionId) => {
+  if (!recoverSessions || !client.pupPage || client.pupPage.isClosed()) {
+    return
+  }
+  const page = client.pupPage
+  const restartSession = async () => {
+    sessions.delete(sessionId)
+    await client.destroy().catch(() => {})
+    await setupSession(sessionId)
+  }
+  page.once('close', () => {
+    logger.warn({ sessionId }, 'Browser page closed. Restoring')
+    restartSession()
+  })
+  page.once('error', () => {
+    logger.warn({ sessionId }, 'Error occurred on browser page. Restoring')
+    restartSession()
+  })
 }
 
 const initializeEvents = (client, sessionId) => {
@@ -227,21 +290,6 @@ const initializeEvents = (client, sessionId) => {
 
   if (recoverSessions) {
     waitForNestedObject(client, 'pupPage').then(() => {
-      const restartSession = async (sessionId) => {
-        sessions.delete(sessionId)
-        await client.destroy().catch(e => { })
-        await setupSession(sessionId)
-      }
-      client.pupPage.once('close', function () {
-        // emitted when the page closes
-        logger.warn({ sessionId }, 'Browser page closed. Restoring')
-        restartSession(sessionId)
-      })
-      client.pupPage.once('error', function () {
-        // emitted when the page crashes
-        logger.warn({ sessionId }, 'Error occurred on browser page. Restoring')
-        restartSession(sessionId)
-      })
       client.pupPage
         .on('console', message => {
           const type = message.type().substr(0, 3).toUpperCase()
