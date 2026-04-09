@@ -25,6 +25,9 @@ const enableWebSocket = process.env.ENABLE_WEBSOCKET ? (process.env.ENABLE_WEBSO
 const autoStartSessions = process.env.AUTO_START_SESSIONS ? (process.env.AUTO_START_SESSIONS).toLowerCase() === 'true' : true
 const basePath = process.env.BASE_PATH || '/'
 const trustProxy = process.env.TRUST_PROXY ? (process.env.TRUST_PROXY).toLowerCase() === 'true' : false
+// Retentativas ao inicializar o Client (WhatsApp Web pode navegar durante inject e destruir o execution context)
+const clientInitializeMaxRetries = Math.max(1, parseInt(process.env.CLIENT_INITIALIZE_MAX_RETRIES || '5', 10))
+const clientInitializeRetryBaseMs = Math.max(200, parseInt(process.env.CLIENT_INITIALIZE_RETRY_BASE_MS || '1500', 10))
 
 module.exports = {
   servicePort,
@@ -49,5 +52,7 @@ module.exports = {
   enableWebSocket,
   autoStartSessions,
   basePath,
-  trustProxy
+  trustProxy,
+  clientInitializeMaxRetries,
+  clientInitializeRetryBaseMs
 }

@@ -2,8 +2,19 @@ const { Client, LocalAuth } = require('whatsapp-web.js')
 const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, clientInitializeMaxRetries, clientInitializeRetryBaseMs } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
+
+const isTransientPuppeteerInitializeError = (err) => {
+  const msg = err && err.message ? err.message : String(err)
+  return (
+    msg.includes('Execution context was destroyed') ||
+    msg.includes('Target closed') ||
+    msg.includes('Session closed') ||
+    msg.includes('Frame was detached') ||
+    msg.includes('Navigation timeout')
+  )
+}
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
 
@@ -165,34 +176,46 @@ const setupSession = async (sessionId) => {
       }
     }
 
-    const client = new Client(clientOptions)
-    if (releaseBrowserLock) {
-      // See https://github.com/puppeteer/puppeteer/issues/4860
-      const singletonLockPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`, 'SingletonLock'))
-      const singletonLockExists = await fs.promises.lstat(singletonLockPath).then(() => true).catch(() => false)
-      if (singletonLockExists) {
-        logger.warn({ sessionId }, 'Browser lock file exists, removing')
-        await fs.promises.unlink(singletonLockPath)
+    let client = null
+    for (let attempt = 1; attempt <= clientInitializeMaxRetries; attempt++) {
+      client = new Client(clientOptions)
+      if (releaseBrowserLock) {
+        // See https://github.com/puppeteer/puppeteer/issues/4860
+        const singletonLockPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`, 'SingletonLock'))
+        const singletonLockExists = await fs.promises.lstat(singletonLockPath).then(() => true).catch(() => false)
+        if (singletonLockExists) {
+          logger.warn({ sessionId }, 'Browser lock file exists, removing')
+          await fs.promises.unlink(singletonLockPath)
+        }
+      }
+
+      try {
+        client.once('ready', () => {
+          patchWWebLibrary(client).catch((err) => {
+            logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
+          })
+        })
+        initWebSocketServer(sessionId)
+        initializeEvents(client, sessionId)
+        await client.initialize()
+        if (attempt > 1) {
+          logger.info({ sessionId, attempt }, 'Sessão iniciada após retentativa de initialize')
+        }
+        sessions.set(sessionId, client)
+        return { success: true, message: 'Session initiated successfully', client }
+      } catch (error) {
+        logger.error({ sessionId, err: error, attempt, maxAttempts: clientInitializeMaxRetries }, 'Initialize error')
+        await client.destroy().catch(() => {})
+        const canRetry = attempt < clientInitializeMaxRetries && isTransientPuppeteerInitializeError(error)
+        if (canRetry) {
+          const delayMs = clientInitializeRetryBaseMs * (2 ** (attempt - 1))
+          logger.warn({ sessionId, attempt, delayMs }, 'Nova tentativa de initialize após erro transitório do navegador')
+          await sleep(delayMs)
+          continue
+        }
+        throw error
       }
     }
-
-    try {
-      client.once('ready', () => {
-        patchWWebLibrary(client).catch((err) => {
-          logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
-        })
-      })
-      initWebSocketServer(sessionId)
-      initializeEvents(client, sessionId)
-      await client.initialize()
-    } catch (error) {
-      logger.error({ sessionId, err: error }, 'Initialize error')
-      throw error
-    }
-
-    // Save the session to the Map
-    sessions.set(sessionId, client)
-    return { success: true, message: 'Session initiated successfully', client }
   } catch (error) {
     return { success: false, message: error.message, client: null }
   }
