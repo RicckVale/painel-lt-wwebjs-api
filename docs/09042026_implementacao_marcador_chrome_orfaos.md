@@ -18,7 +18,7 @@ Ao reiniciar o Node sem `SIGTERM` gracioso (ou em falhas), processos filhos do C
 
 | Variável | Efeito |
 |----------|--------|
-| `WWEBJS_BROWSER_MARKER` | Opcional; evita colisão entre várias instâncias com o mesmo `SESSIONS_PATH` (raro); formato `[a-zA-Z0-9_-]{4,128}`. |
+| `WWEBJS_BROWSER_MARKER` | Opcional (legível no `ps`); se vazio, deriva do `SESSIONS_PATH`. Várias instâncias no mesmo servidor: cada uma deve ter **`SESSIONS_PATH` distinto**; a limpeza no boot só encerra processos cujo `user-data-dir` está sob `.chrome-profiles` **dessa** pasta **e** que tragam o marcador só quando coincide com o mesmo prefixo (não mata a outra instância só por marcador igual). |
 | `CLEANUP_ORPHAN_BROWSERS_ON_STARTUP` | `false` desativa varredura no boot (ex.: debug). |
 | `CHROME_BIN` | Binário do Chrome/Chromium (ex.: stable no servidor). |
 
@@ -30,3 +30,4 @@ Ao reiniciar o Node sem `SIGTERM` gracioso (ou em falhas), processos filhos do C
 ## Histórico de Modificações Recentes
 
 - Registro inicial desta implementação.
+- Ajuste: limpeza por marcador exige também o prefixo `user-data-dir` sob o `SESSIONS_PATH` da instância, permitindo o mesmo `WWEBJS_BROWSER_MARKER` em várias instâncias com pastas de sessão diferentes.

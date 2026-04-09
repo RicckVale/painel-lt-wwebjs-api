@@ -9,7 +9,8 @@ const resolveChromeProfilesRoot = (sessionFolderPath) =>
 
 /**
  * Linux: encerra processos cujo /proc/PID/cmdline contém a needle (ex.: user-data-dir absoluto ou flag wwebjs).
- * Não mata processos de outras instâncias se SESSIONS_PATH + marker forem distintos por .env.
+ * Limpeza usa o prefixo user-data-dir em <SESSIONS_PATH>/.chrome-profiles.
+ * O marcador só conta junto com esse prefixo, para não matar Chrome de outra instância com o mesmo WWEBJS_BROWSER_MARKER.
  */
 const killMatchingPidsLinux = async (profileRoot, marker) => {
   if (process.platform !== 'linux') {
@@ -41,7 +42,10 @@ const killMatchingPidsLinux = async (profileRoot, marker) => {
       /chrome|chromium|Chrome|google-chrome/i.test(cmd) ||
       cmd.includes('puppeteer')
     const hitProfile = cmd.includes(profileNeedle)
-    const hitMarker = cmd.includes(markerNeedle) && looksLikeBrowser
+    const hitMarker =
+      cmd.includes(markerNeedle) &&
+      looksLikeBrowser &&
+      cmd.includes(profileRoot)
     if (!hitProfile && !hitMarker) continue
     matches.add(parseInt(ent, 10))
   }
