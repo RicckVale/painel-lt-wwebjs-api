@@ -253,6 +253,7 @@ const wipeSessionAuthData = async (sessionId) => {
 // Setup Session
 const setupSession = async (sessionId, setupOptions = {}) => {
   const resetDataRetryExhausted = setupOptions.resetDataRetryExhausted === true
+  let pendingSessionRegistered = false
   try {
     await ensureSessionDirectory()
 
@@ -266,6 +267,7 @@ const setupSession = async (sessionId, setupOptions = {}) => {
     }
 
     pendingSessions.add(sessionId)
+    pendingSessionRegistered = true
     logger.info({ sessionId, resetDataRetryExhausted }, 'Session is being initiated')
     // Disable delete folder from logout function (handled separately)
     const localAuth = new LocalAuth({ clientId: sessionId, dataPath: sessionFolderPath })
@@ -418,8 +420,11 @@ const setupSession = async (sessionId, setupOptions = {}) => {
 
     return { success: false, message: lastError ? lastError.message : 'session init failed', client: null }
   } catch (error) {
-    pendingSessions.delete(sessionId)
     return { success: false, message: error.message, client: null }
+  } finally {
+    if (pendingSessionRegistered) {
+      pendingSessions.delete(sessionId)
+    }
   }
 }
 
