@@ -5,14 +5,33 @@ const sessions = new Map()
 const pendingSessions = new Set()
 const sessionLocks = new Map()
 const restartAttempts = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock } = require('./config')
+const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, webVersion, webVersionCacheType, recoverSessions, chromeBin, headless, releaseBrowserLock, clientInitializeMaxRetries, clientInitializeRetryBaseMs, puppeteerProtocolTimeoutMs, wipeSessionDataAfterInitFailure, wwebjsBrowserMarker } = require('./config')
 const { triggerWebhook, waitForNestedObject, isEventEnabled, sendMessageSeenStatus, sleep, patchWWebLibrary } = require('./utils')
+
+const isTransientPuppeteerInitializeError = (err) => {
+  const msg = err && err.message ? err.message : String(err)
+  const name = err && err.name ? err.name : ''
+  return (
+    name === 'ProtocolError' ||
+    msg.includes('Execution context was destroyed') ||
+    msg.includes('Target closed') ||
+    msg.includes('Session closed') ||
+    msg.includes('Frame was detached') ||
+    msg.includes('Navigation timeout') ||
+    msg.includes('Runtime.callFunctionOn timed out') ||
+    msg.includes('protocolTimeout')
+  )
+}
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
 
 const MAX_RESTART_ATTEMPTS = 3
 const RESTART_COOLDOWN_MS = 30000
 const RESTART_RESET_MS = 120000
+
+const ensureSessionDirectory = async () => {
+  await fs.promises.mkdir(sessionFolderPath, { recursive: true })
+}
 
 const acquireSessionLock = async (sessionId) => {
   while (sessionLocks.get(sessionId)) {
@@ -219,9 +238,24 @@ const restoreSessions = () => {
   }
 }
 
+// Remove apenas a pasta LocalAuth (session-<id>) sem passar pelo fluxo de logout API
+const wipeSessionAuthData = async (sessionId) => {
+  const resolvedBase = path.resolve(sessionFolderPath)
+  const targetDirPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`))
+  const basePrefix = resolvedBase.endsWith(path.sep) ? resolvedBase : `${resolvedBase}${path.sep}`
+  if (!targetDirPath.startsWith(basePrefix)) {
+    throw new Error('Invalid path: Directory traversal detected')
+  }
+  await fs.promises.rm(targetDirPath, { recursive: true, force: true })
+  logger.warn({ sessionId }, 'Dados locais da sessão removidos (pasta session-<id>)')
+}
+
 // Setup Session
-const setupSession = async (sessionId) => {
+const setupSession = async (sessionId, setupOptions = {}) => {
+  const resetDataRetryExhausted = setupOptions.resetDataRetryExhausted === true
   try {
+    await ensureSessionDirectory()
+
     if (sessions.has(sessionId)) {
       return { success: false, message: `Session already exists for: ${sessionId}`, client: sessions.get(sessionId) }
     }
@@ -232,8 +266,8 @@ const setupSession = async (sessionId) => {
     }
 
     pendingSessions.add(sessionId)
-    logger.info({ sessionId }, 'Session is being initiated')
-
+    logger.info({ sessionId, resetDataRetryExhausted }, 'Session is being initiated')
+    // Disable delete folder from logout function (handled separately)
     const localAuth = new LocalAuth({ clientId: sessionId, dataPath: sessionFolderPath })
     delete localAuth.logout
     localAuth.logout = () => { }
@@ -242,7 +276,9 @@ const setupSession = async (sessionId) => {
       puppeteer: {
         executablePath: chromeBin,
         headless,
+        ...(puppeteerProtocolTimeoutMs > 0 ? { protocolTimeout: puppeteerProtocolTimeoutMs } : {}),
         args: [
+          `--wwebjs-app-marker=${wwebjsBrowserMarker}`,
           '--autoplay-policy=user-gesture-required',
           '--disable-background-networking',
           '--disable-background-timer-throttling',
@@ -286,6 +322,11 @@ const setupSession = async (sessionId) => {
       authStrategy: localAuth
     }
 
+    if (clientOptions.puppeteer?.userDataDir) {
+      delete clientOptions.puppeteer.userDataDir
+      logger.warn({ sessionId }, 'Ignoring custom puppeteer userDataDir because LocalAuth is enabled')
+    }
+
     if (webVersion) {
       clientOptions.webVersion = webVersion
       switch (webVersionCacheType.toLowerCase()) {
@@ -307,42 +348,75 @@ const setupSession = async (sessionId) => {
       }
     }
 
-    const client = new Client(clientOptions)
-
-    if (releaseBrowserLock) {
-      const singletonLockPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`, 'SingletonLock'))
-      const singletonLockExists = await fs.promises.lstat(singletonLockPath).then(() => true).catch(() => false)
-      if (singletonLockExists) {
-        const isSessionActive = sessions.has(sessionId)
-        if (isSessionActive) {
-          logger.warn({ sessionId }, 'Browser lock exists but session is active, skipping lock removal')
-        } else {
-          logger.warn({ sessionId }, 'Browser lock file exists (stale), removing')
-          await fs.promises.unlink(singletonLockPath)
+    let client = null
+    let lastError = null
+    for (let attempt = 1; attempt <= clientInitializeMaxRetries; attempt++) {
+      client = new Client(clientOptions)
+      if (releaseBrowserLock) {
+        const singletonLockPath = path.resolve(path.join(sessionFolderPath, `session-${sessionId}`, 'SingletonLock'))
+        const singletonLockExists = await fs.promises.lstat(singletonLockPath).then(() => true).catch(() => false)
+        if (singletonLockExists) {
+          const isSessionActive = sessions.has(sessionId)
+          if (isSessionActive) {
+            logger.warn({ sessionId }, 'Browser lock exists but session is active, skipping lock removal')
+          } else {
+            logger.warn({ sessionId }, 'Browser lock file exists (stale), removing')
+            await fs.promises.unlink(singletonLockPath)
+          }
         }
+      }
+
+      try {
+        client.once('ready', () => {
+          patchWWebLibrary(client).catch((err) => {
+            logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
+          })
+        })
+        initWebSocketServer(sessionId)
+        initializeEvents(client, sessionId)
+        await client.initialize()
+        if (attempt > 1) {
+          logger.info({ sessionId, attempt }, 'Sessão iniciada após retentativa de initialize')
+        }
+        restartAttempts.delete(sessionId)
+        sessions.set(sessionId, client)
+        const payload = { success: true, message: 'Session initiated successfully', client }
+        if (resetDataRetryExhausted) {
+          payload.sessionDataReset = true
+          payload.message = 'Session initiated successfully after clearing local session data (scan QR again if required)'
+        }
+        return payload
+      } catch (error) {
+        lastError = error
+        logger.error({ sessionId, err: error, attempt, maxAttempts: clientInitializeMaxRetries }, 'Initialize error')
+        await client.destroy().catch(() => { })
+        await killBrowserProcess(client, sessionId)
+        const canRetry = attempt < clientInitializeMaxRetries && isTransientPuppeteerInitializeError(error)
+        if (canRetry) {
+          const delayMs = clientInitializeRetryBaseMs * (2 ** (attempt - 1))
+          logger.warn({ sessionId, attempt, delayMs }, 'Nova tentativa de initialize após erro transitório do navegador')
+          await sleep(delayMs)
+          continue
+        }
+        break
       }
     }
 
-    try {
-      client.once('ready', () => {
-        restartAttempts.delete(sessionId)
-        patchWWebLibrary(client).catch((err) => {
-          logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
-        })
-      })
-      initWebSocketServer(sessionId)
-      initializeEvents(client, sessionId)
-      await client.initialize()
-    } catch (error) {
-      logger.error({ sessionId, err: error }, 'Initialize error')
-      await killBrowserProcess(client, sessionId)
-      pendingSessions.delete(sessionId)
-      throw error
+    if (lastError && wipeSessionDataAfterInitFailure && !resetDataRetryExhausted) {
+      logger.warn({ sessionId }, 'Falha ao inicializar com dados atuais; removendo auth local e repetindo uma vez do zero')
+      try {
+        await wipeSessionAuthData(sessionId)
+      } catch (wipeErr) {
+        logger.error({ sessionId, err: wipeErr }, 'Não foi possível remover a pasta da sessão antes do retry')
+      }
+      const retryResult = await setupSession(sessionId, { resetDataRetryExhausted: true })
+      if (retryResult.success) {
+        return retryResult
+      }
+      return { success: false, message: retryResult.message || (lastError && lastError.message) || 'session init failed', client: null }
     }
 
-    sessions.set(sessionId, client)
-    pendingSessions.delete(sessionId)
-    return { success: true, message: 'Session initiated successfully', client }
+    return { success: false, message: lastError ? lastError.message : 'session init failed', client: null }
   } catch (error) {
     pendingSessions.delete(sessionId)
     return { success: false, message: error.message, client: null }
@@ -672,6 +746,17 @@ const reloadSession = async (sessionId) => {
   }
 }
 
+const destroyAllSessions = async () => {
+  const ids = [...sessions.keys()]
+  for (const id of ids) {
+    try {
+      await destroySession(id)
+    } catch (err) {
+      logger.error({ sessionId: id, err }, 'destroyAllSessions: falha ao parar uma sessão')
+    }
+  }
+}
+
 const destroySession = async (sessionId) => {
   await acquireSessionLock(sessionId)
   try {
@@ -765,6 +850,7 @@ const deleteSession = async (sessionId, validation) => {
 // Function to handle session flush
 const flushSessions = async (deleteOnlyInactive) => {
   try {
+    await ensureSessionDirectory()
     const files = await fs.promises.readdir(sessionFolderPath)
     let flushedCount = 0
     let skippedCount = 0
@@ -819,5 +905,6 @@ module.exports = {
   deleteSession,
   reloadSession,
   flushSessions,
-  destroySession
+  destroySession,
+  destroyAllSessions
 }

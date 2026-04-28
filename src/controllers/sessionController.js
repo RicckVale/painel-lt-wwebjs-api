@@ -44,7 +44,11 @@ const startSession = async (req, res) => {
     */
     // wait until the client is created
     await waitForNestedObject(setupSessionReturn.client, 'pupPage')
-    res.json({ success: true, message: setupSessionReturn.message })
+    const payload = { success: true, message: setupSessionReturn.message }
+    if (setupSessionReturn.sessionDataReset) {
+      payload.sessionDataReset = true
+    }
+    res.json(payload)
   } catch (error) {
     logger.error({ sessionId, err: error }, 'Failed to start session')
     sendErrorResponse(res, 500, error.message)
