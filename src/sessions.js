@@ -411,6 +411,9 @@ const setupSession = async (sessionId, setupOptions = {}) => {
       } catch (wipeErr) {
         logger.error({ sessionId, err: wipeErr }, 'Não foi possível remover a pasta da sessão antes do retry')
       }
+      // Libera o estado pendente antes do retry recursivo para evitar falso "already in progress".
+      pendingSessions.delete(sessionId)
+      pendingSessionRegistered = false
       const retryResult = await setupSession(sessionId, { resetDataRetryExhausted: true })
       if (retryResult.success) {
         return retryResult

@@ -111,6 +111,18 @@ const sendMessage = async (req, res) => {
     }
     res.json({ success: true, message: messageOut })
   } catch (error) {
+    const errBody = req.body
+    const errDetail = {
+      message: error?.message,
+      name: error?.constructor?.name ?? typeof error,
+      stack: error?.stack ? error.stack.split('\n').slice(0, 6).join(' | ') : 'no-stack',
+      raw: typeof error === 'string' ? error : undefined,
+      chatId: errBody?.chatId,
+      contentType: errBody?.contentType,
+      mimetype: errBody?.content?.mimetype,
+      filename: errBody?.content?.filename,
+    }
+    console.error('[CRM-sendMessage-error]', JSON.stringify(errDetail))
     sendErrorResponse(res, 500, error.message)
   }
 }
