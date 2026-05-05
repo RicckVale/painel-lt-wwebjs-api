@@ -109,7 +109,10 @@ const patchWWebLibrary = async (client) => {
 
       if (searchOptions && searchOptions.limit > 0) {
         while (msgs.length < searchOptions.limit) {
-          const loadedMessages = await (window.require('WAWebChatLoadMessages')).loadEarlierMsgs({ chat })
+          const loadedMessages = await window.require('WAWebChatLoadMessages').loadEarlierMsgs({
+            chat,
+            msgCollection: chat.msgs
+          })
 
           if (!loadedMessages || !loadedMessages.length) break
           msgs = [...loadedMessages.filter(msgFilter), ...msgs]
@@ -127,8 +130,26 @@ const patchWWebLibrary = async (client) => {
     return messages.map(m => new Message(this.client, m))
   }
 
-  await client.pupPage.evaluate(() => {
+  // Em alguns estados (ex.: logo após initialize / aguardando QR) WWebJS ainda não está no window.
+  const wwebjsReadyDeadline = Date.now() + 2500
+  while (Date.now() < wwebjsReadyDeadline) {
+    let injected = false
+    try {
+      injected = await client.pupPage.evaluate(
+        () => typeof window.WWebJS === 'object' && window.WWebJS !== null && typeof window.WWebJS.getChatModel === 'function'
+      )
+    } catch {
+      injected = false
+    }
+    if (injected) break
+    await sleep(100)
+  }
+
+  const getChatsHotfixApplied = await client.pupPage.evaluate(() => {
     // hotfix for https://github.com/pedroslopez/whatsapp-web.js/pull/3643
+    if (typeof window.WWebJS !== 'object' || !window.WWebJS) {
+      return false
+    }
     window.WWebJS.getChats = async (searchOptions = {}) => {
       const chatFilter = (c) => {
         if (searchOptions && searchOptions.unread === true && c.unreadCount === 0) {
@@ -148,7 +169,12 @@ const patchWWebLibrary = async (client) => {
         filteredChats.map(chat => window.WWebJS.getChatModel(chat))
       )
     }
+    return true
   })
+
+  if (!getChatsHotfixApplied) {
+    logger.debug('patchWWebLibrary: hotfix WWebJS.getChats não aplicado (inject ainda indisponível após espera)')
+  }
 }
 
 module.exports = {

@@ -369,14 +369,16 @@ const setupSession = async (sessionId, setupOptions = {}) => {
       }
 
       try {
-        client.once('ready', () => {
-          patchWWebLibrary(client).catch((err) => {
-            logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
-          })
-        })
         initWebSocketServer(sessionId)
         initializeEvents(client, sessionId)
         await client.initialize()
+        // O patch DEVE concluir antes da sessão aceitar tráfego: caso contrário fetchMessages/sync
+        // ainda usa o prototype da lib e pode quebrar com waitForChatLoading (WA Web mudou loadEarlierMsgs).
+        try {
+          await patchWWebLibrary(client)
+        } catch (err) {
+          logger.error({ sessionId, err }, 'Failed to patch WWebJS library')
+        }
         if (attempt > 1) {
           logger.info({ sessionId, attempt }, 'Sessão iniciada após retentativa de initialize')
         }
