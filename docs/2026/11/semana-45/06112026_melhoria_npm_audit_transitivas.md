@@ -23,7 +23,7 @@ A dependência direta em `package.json` apontava para `github:wwebjs/whatsapp-we
 
 ### 2. Overrides de Dependências Transitivas
 Foram declarados overrides no `package.json` para eliminar vulnerabilidades de dependências profundas sem alterar os pacotes de primeiro nível:
-- **`@puppeteer/browsers` (`^3.2.2`):** alinhado com a regra da API. Resolve para a linha 3.2.6, substituindo a biblioteca vulnerável `extract-zip` (`<=2.0.1` — GHSA-jmr9-qjv8-65gv / GHSA-7pqw-9j4j-h8q3) por `modern-tar`.
+- **`@puppeteer/browsers` (`3.2.6` fixo):** versão exata sem acento circunflexo largo, eliminando a dependência vulnerável `extract-zip` (`<=2.0.1` — GHSA-jmr9-qjv8-65gv / GHSA-7pqw-9j4j-h8q3) via `modern-tar`. *(Detalhes sobre Node 20 na seção abaixo)*.
 - **`basic-ftp` (`^6.2.6`):** elimina a vulnerabilidade de CPU ReDoS no parser de listagem de diretórios Unix (GHSA-c475-qrg2-pj4r) puxada via `proxy-agent` -> `pac-proxy-agent` -> `get-uri`.
 - **`glob` (`^14.0.4`) e `minimatch` (`^11.0.5`):** eliminam as vulnerabilidades de traversal pós-timeout via AbortSignal (GHSA-3g3m-2fjr-6pw4) e DoS por amplificação de globparts / ReDoS (GHSA-g3hv-75wg-m249 / GHSA-23c5-xmqv-rm74) na árvore de `archiver` e `archiver-utils`.
 - **`zod` (`^4.6.7`):** atualiza para versão corrigida do DoS por esgotamento de memória em validação de coleções restritas (GHSA-mrhx-c7xc-m3w5). Os módulos e protocol parsers do `chromium-bidi` v14 foram testados e executam normalmente.
@@ -35,15 +35,46 @@ Resolução sem breaking changes de advisories diretas e transitivas:
 - `proxy-addr` atualizado para 2.0.8 (fechando spoofing de IP em trust subnet IPv4-mapped IPv6).
 - `body-parser` (1.20.9), `qs` (6.16.2), `path-to-regexp` (0.1.13) e `ip-address` (10.7.6).
 
+---
+
+## Investigação Detalhada: `@puppeteer/browsers` e Compatibilidade com Node 20
+
+A equipe de QA solicitou a verificação minuciosa dos campos `engines` e `dependencies` de todas as versões 3.x publicadas de `@puppeteer/browsers` (de 3.0.0 a 3.2.6) para identificar a maior versão que não dependesse de `extract-zip` e cujo `engines` aceitasse Node 20 (versão de produção).
+
+### Levantamento no Registro Oficial NPM
+
+A consulta direta ao registro do npm retornou o seguinte histórico para a linha 3.x e a linha 2.13.x:
+
+| Versão | `engines.node` declarado | Depende de `extract-zip`? | Descompressor utilizado |
+| :--- | :--- | :---: | :--- |
+| `2.13.0` | `>=18` (aceita Node 20) | **Sim** (`^2.0.1`) | `extract-zip` + `tar-fs` |
+| `2.13.1` | `>=18` (aceita Node 20) | **Sim** (`^2.0.1`) | `extract-zip` + `tar-fs` |
+| `2.13.2` | `>=18` (aceita Node 20) | **Sim** (`^2.0.1`) | `extract-zip` + `tar-fs` |
+| `3.0.0` / `3.0.1` | *(Não publicadas no npm)* | — | — |
+| `3.0.2` | `>=22.12.0` | **Não** | `tar-fs` |
+| `3.0.3` | `>=22.12.0` | **Não** | `tar-fs` |
+| `3.0.4` a `3.2.6` | `>=22.12.0` | **Não** | `modern-tar` |
+
+### Conclusão Técnica e Tratamento do Resíduo de Engine
+
+1. **Inexistência de versão 3.x com `engines` para Node 20:** Ao saltar para a major 3, o upstream do Puppeteer elevou simultaneamente a exigência mínima de engine para `>=22.12.0` em **todas** as versões da série 3. Nenhuma versão 3.x aceita formalmente Node 20 no `package.json`.
+2. **Dependência inevitável em 2.x:** Todas as versões da linha 2.x que aceitam Node 20 (`2.13.x`) dependem diretamente de `extract-zip: ^2.0.1`, que é o vetor de vulnerabilidade de alta gravidade sem correção na linha 2.
+3. **Comportamento em Runtime no Node 20:** Em tempo de execução sob Node `v20.20.0`, `@puppeteer/browsers@3.2.6` não utiliza chamadas de sistema exclusivas do Node 22 que impeçam a execução. Os módulos `puppeteer`, `puppeteer-core` e `whatsapp-web.js` carregam com sucesso via `require()`. O único efeito colateral é o aviso não-bloqueante `EBADENGINE` emitido pelo gerenciador de pacotes npm durante a instalação.
+4. **Fixação Exata:** Foi fixada a versão exata `"@puppeteer/browsers": "3.2.6"` no override do `package.json` (sem acento circunflexo `^`) para manter estabilidade absoluta do lockfile e garantir que `extract-zip` permaneça ausente da árvore de dependências (`npm ls extract-zip` retorna vazio).
+
+---
+
 ## Resíduo Documentado
 
-Restaram apenas **7 vulnerabilidades de severidade `low`**, todas originadas do pacote `deepmerge` (`>=4.2.0 <=4.3.1` — GHSA-gcqx-w48m-w2h4), dependência de ferramentas de desenvolvimento:
-- Utilizado por `jest-config` (suíte Jest) e `swagger-autogen`.
-- O npm audit indica resolução apenas via `npm audit fix --force`, o que rebaixaria `jest` para 25.1.0 e `swagger-autogen` para 2.7.7 (mudanças breaking em ferramentas de teste/documentação).
-- Por regra expressa do projeto, o downgrade do Jest e o uso de `--force` foram descartados, mantendo o resíduo contido no ambiente de desenvolvimento/testes sem impacto em runtime de produção.
+1. **Aviso `EBADENGINE` em Node 20**: Conforme detalhado acima, decorrente da exigência de `node >=22.12.0` em toda a major 3 do `@puppeteer/browsers`. Mantido para neutralizar o risco de segurança crítico/alto do `extract-zip`.
+2. **7 vulnerabilidades `low` em `deepmerge` (`>=4.2.0 <=4.3.1` — GHSA-gcqx-w48m-w2h4)**: Dependência exclusiva de ferramentas de teste e geração de docs (`jest-config` e `swagger-autogen`). Não foi aplicado `--force` para evitar quebra com downgrade de `jest` para a v25 e `swagger-autogen` para a v2.7.7.
+
+---
 
 ## Validação Executada
 
+- `npm ls extract-zip`: Retorna `(empty)`, confirmando a eliminação completa da dependência vulnerável.
+- `npm ls @puppeteer/browsers`: Confirma a versão fixada `3.2.6 overridden`.
 - `node --check` validou sintaxe de todos os arquivos JS em `server.js`, `swagger.js` e `src/**/*.js`.
-- Teste de `require()` e instanciação de parsers de protocolo executado com sucesso no Node.js v20.20.0 para `@puppeteer/browsers`, `puppeteer`, `chromium-bidi` e `whatsapp-web.js` sem disparar processos de navegador.
-- Nenhuma execução de scripts em lifecycle npm (`--ignore-scripts` preservado em todas as etapas).
+- Teste de `require()` executado com sucesso no Node.js v20.20.0 para `puppeteer` e `whatsapp-web.js` sem disparar processos de navegador.
+- `--ignore-scripts` preservado em todas as etapas de `npm install`.
