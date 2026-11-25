@@ -1,4 +1,5 @@
 const { sessions } = require('../sessions')
+const { syncHistoryHandler } = require('./historySync')
 const { sendErrorResponse, sendNotSupported } = require('../utils')
 
 /**
@@ -352,19 +353,8 @@ const syncHistory = async (req, res) => {
   /*
     #swagger.summary = 'Sync chat history'
   */
-  try {
-    const { chatId } = req.body
-    const client = sessions.get(req.params.sessionId)
-    const chat = await client.getChatById(chatId)
-    if (!chat) {
-      sendErrorResponse(res, 404, 'Chat not Found')
-      return
-    }
-    const result = await chat.syncHistory()
-    res.json({ success: true, result })
-  } catch (error) {
-    sendErrorResponse(res, 500, error.message)
-  }
+  // Mesmo caminho nas duas rotas: fetchMessageHistory a partir da mensagem mais antiga guardada.
+  return syncHistoryHandler(req, res)
 }
 
 /**

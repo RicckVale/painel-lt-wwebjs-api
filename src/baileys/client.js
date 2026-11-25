@@ -12,6 +12,32 @@ const {
 } = require('./serialize')
 const { toBaileysJid, toWwebjsId, toWid, isGroupJid, isLidJid, isPnJid, isNewsletterJid, phoneDigits } = require('./jid')
 
+// proto.HistorySync.HistorySyncType
+const HISTORY_SYNC_TYPES = {
+  0: 'INITIAL_BOOTSTRAP',
+  1: 'INITIAL_STATUS_V3',
+  2: 'FULL',
+  3: 'RECENT',
+  4: 'PUSH_NAME',
+  5: 'NON_BLOCKING_DATA',
+  6: 'ON_DEMAND'
+}
+const historySyncTypeName = (value) => {
+  if (value == null) return null
+  if (typeof value === 'string') return value
+  return HISTORY_SYNC_TYPES[value] || String(value)
+}
+const HISTORY_CHUNK = 200
+const yieldLoop = () => new Promise((resolve) => setImmediate(resolve))
+
+class HistorySyncError extends Error {
+  constructor (message, statusCode) {
+    super(message)
+    this.name = 'HistorySyncError'
+    this.statusCode = statusCode
+  }
+}
+
 const DisconnectCode = {
   connectionClosed: 428,
   connectionLost: 408,
@@ -302,7 +328,7 @@ class BaileysChat {
   }
 
   async getContact () { return this.client.getContactById(this.id._serialized) }
-  async syncHistory () { return this.client.syncHistory(this.id._serialized) }
+  async syncHistory (options) { return this.client.syncHistory(this.id._serialized, options) }
   async getLabels () { throw new NotSupportedError('chat.getLabels') }
   async changeLabels () { throw new NotSupportedError('chat.changeLabels') }
 
@@ -412,7 +438,11 @@ class BaileysClient extends EventEmitter {
     this.sessionId = sessionId
     this.authDir = authDir
     this.options = options
-    this.store = new SessionStore({ dir: authDir })
+    this.store = new SessionStore({
+      dir: authDir,
+      maxMessagesPerChat: options.storeMaxMessagesPerChat,
+      maxPersistedMessagesPerChat: options.storePersistMessagesPerChat
+    })
     this.sock = null
     this.qr = null
     this.info = null
@@ -427,6 +457,13 @@ class BaileysClient extends EventEmitter {
     this.numberIdCache = new Map()
     this.groupCache = new Map()
     this.historyRequests = new Map()
+    // Sincronização de histórico (messaging-history.set): fila assíncrona para não travar o socket,
+    // último estado recebido e quem espera resposta ON_DEMAND de fetchMessageHistory.
+    this.historyQueue = Promise.resolve()
+    this.historyState = { syncType: null, progress: null, isLatest: null, chunks: 0, messages: 0, at: null }
+    this.historyStatus = {}
+    this.onDemandWaiters = []
+    this.backgroundSync = options.syncFullHistory !== false
     this.pendingOwnSends = new Set()
     this.baileysVersion = null
     this.interface = {
@@ -480,7 +517,10 @@ class BaileysClient extends EventEmitter {
       auth: { creds: this.authState.creds, keys },
       logger: blogger,
       markOnlineOnConnect: false,
-      syncFullHistory: this.options.syncFullHistory === true,
+      // Nível mais completo da doc do Baileys (advanced/history-sync): syncFullHistory + perfil macOS Desktop,
+      // sem descartar nenhum tipo de sync (INITIAL_BOOTSTRAP, RECENT, FULL, ON_DEMAND, NON_BLOCKING_DATA...).
+      syncFullHistory: this.backgroundSync,
+      shouldSyncHistoryMessage: () => true,
       generateHighQualityLinkPreview: false,
       getMessage: async (key) => {
         const stored = this.store.getMessage(this.store.canonicalChatId(key.remoteJid, key.remoteJidAlt), key.id)
@@ -488,7 +528,7 @@ class BaileysClient extends EventEmitter {
       },
       cachedGroupMetadata: async (jid) => this.groupCache.get(jid)?.meta
     }
-    if (b.Browsers && typeof b.Browsers.ubuntu === 'function') socketOptions.browser = b.Browsers.ubuntu('Chrome')
+    if (b.Browsers && typeof b.Browsers.macOS === 'function') socketOptions.browser = b.Browsers.macOS('Desktop')
     if (this.baileysVersion) socketOptions.version = this.baileysVersion
     const sock = b.makeWASocket(socketOptions)
     this.sock = sock
@@ -511,6 +551,7 @@ class BaileysClient extends EventEmitter {
     ev.on('creds.update', guard('creds.update', () => this.saveCreds()))
     ev.on('connection.update', guard('connection.update', (u) => this._onConnectionUpdate(u)))
     ev.on('messaging-history.set', guard('messaging-history.set', (h) => this._onHistory(h)))
+    ev.on('messaging-history.status', guard('messaging-history.status', (st) => this._onHistoryStatus(st)))
     ev.on('chats.upsert', guard('chats.upsert', (chats) => chats.forEach((c) => this.store.applyBaileysChat(c))))
     ev.on('chats.update', guard('chats.update', (updates) => this._onChatsUpdate(updates)))
     ev.on('chats.delete', guard('chats.delete', (ids) => ids.forEach((id) => this.store.deleteChat(id))))
@@ -694,11 +735,105 @@ class BaileysClient extends EventEmitter {
 
   // ===== Eventos do Baileys → eventos estilo whatsapp-web.js =====
 
-  _onHistory ({ chats = [], contacts = [], messages = [], lidPnMappings = [] } = {}) {
+  // Não processa no handler do socket: enfileira e devolve na hora (o histórico pode ter milhares de mensagens).
+  _onHistory (payload = {}) {
+    this.historyQueue = this.historyQueue
+      .then(() => this._processHistory(payload))
+      .catch((err) => logger.error({ sessionId: this.sessionId, err }, 'Falha ao processar messaging-history.set'))
+    return this.historyQueue
+  }
+
+  async _processHistory ({ chats = [], contacts = [], messages = [], lidPnMappings = [], isLatest, progress, syncType, peerDataRequestSessionId } = {}) {
     for (const m of lidPnMappings || []) this.store.addLidMapping(m?.lid, m?.pn)
-    for (const c of contacts) this.store.upsertContact(c)
-    for (const c of chats) this.store.applyBaileysChat(c)
-    for (const m of messages) this.store.upsertMessage(m)
+    for (let i = 0; i < (contacts || []).length; i++) {
+      if (i && i % HISTORY_CHUNK === 0) await yieldLoop()
+      this.store.upsertContact(contacts[i])
+    }
+    for (let i = 0; i < (chats || []).length; i++) {
+      if (i && i % HISTORY_CHUNK === 0) await yieldLoop()
+      this.store.applyBaileysChat(chats[i])
+    }
+    const fresh = []
+    const chatJids = new Set()
+    for (let i = 0; i < (messages || []).length; i++) {
+      if (i && i % HISTORY_CHUNK === 0) await yieldLoop()
+      const raw = messages[i]
+      if (!raw?.key?.id || !raw.key.remoteJid || raw.key.remoteJid === 'status@broadcast') continue
+      chatJids.add(this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt))
+      const known = !!this.store.getMessage(this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt), raw.key.id)
+      this.store.upsertMessage(raw)
+      if (known) continue
+      const ckey = contentKey(unwrapContent(raw.message))
+      if (!ckey || ckey === 'protocolMessage' || ckey === 'reactionMessage') continue
+      fresh.push(raw)
+    }
+    const typeName = historySyncTypeName(syncType)
+    this.historyState = {
+      syncType: typeName,
+      progress: progress ?? null,
+      isLatest: isLatest ?? null,
+      chunks: this.historyState.chunks + 1,
+      messages: this.historyState.messages + fresh.length,
+      at: Date.now()
+    }
+    if (typeName === 'ON_DEMAND') {
+      this._resolveOnDemand({ peerDataRequestSessionId, chatIds: chatJids, syncType: typeName, progress: progress ?? null, isLatest: isLatest ?? null, received: fresh.length })
+    }
+    this.emit('history_sync', { syncType: typeName, progress: progress ?? null, isLatest: isLatest ?? null, chats: (chats || []).length, messages: (messages || []).length, fresh: fresh.length })
+    await this._emitHistoryMessages(fresh)
+  }
+
+  // Webhook só para id novo e dentro da janela de idade: o ingest do Floume trata webhook "message" como
+  // mensagem ao vivo (chatbot, notificação, lead scoring). O restante do histórico chega ao CRM pelo
+  // fetchMessages (syncHistoryForChat), que promove como histórico.
+  async _emitHistoryMessages (fresh) {
+    const maxAge = Number(this.options.historyWebhookMaxAgeSeconds ?? 900)
+    if (maxAge === 0) return
+    const now = Math.floor(Date.now() / 1000)
+    let sent = 0
+    for (const raw of fresh) {
+      const ts = toNumber(raw.messageTimestamp)
+      if (maxAge > 0 && (!ts || now - ts > maxAge)) continue
+      if (sent && sent % HISTORY_CHUNK === 0) await yieldLoop()
+      const msg = new BaileysMessage(this, raw)
+      if (raw.key.fromMe) {
+        this.emit('message_create', msg)
+      } else {
+        this.emit('message', msg)
+      }
+      sent++
+    }
+  }
+
+  _onHistoryStatus (st = {}) {
+    const name = historySyncTypeName(st.syncType)
+    if (name) this.historyStatus[name] = { status: st.status, explicit: !!st.explicit, at: Date.now() }
+  }
+
+  _waitOnDemand (chatId, timeoutMs) {
+    const waiter = { chatId, requestId: null, done: false }
+    waiter.promise = new Promise((resolve) => {
+      waiter.resolve = (value) => {
+        if (waiter.done) return
+        waiter.done = true
+        clearTimeout(waiter.timer)
+        this.onDemandWaiters = this.onDemandWaiters.filter((w) => w !== waiter)
+        resolve(value)
+      }
+      waiter.timer = setTimeout(() => waiter.resolve(null), timeoutMs)
+      if (typeof waiter.timer.unref === 'function') waiter.timer.unref()
+    })
+    this.onDemandWaiters.push(waiter)
+    return waiter
+  }
+
+  _resolveOnDemand (result) {
+    const { peerDataRequestSessionId, chatIds } = result
+    const pending = this.onDemandWaiters.filter((w) => !w.done)
+    const match = (peerDataRequestSessionId && pending.find((w) => w.requestId === peerDataRequestSessionId)) ||
+      pending.find((w) => chatIds.has(w.chatId)) ||
+      (!chatIds.size ? pending[0] : null)
+    if (match) match.resolve(result)
   }
 
   _onChatsUpdate (updates) {
@@ -861,10 +996,11 @@ class BaileysClient extends EventEmitter {
   }
 
   _requestOlderHistory (chatId) {
+    if (!this.backgroundSync) return
     const last = this.historyRequests.get(chatId) || 0
     if (Date.now() - last < HISTORY_REQUEST_COOLDOWN_MS) return
     this.historyRequests.set(chatId, Date.now())
-    this.syncHistory(chatId).catch(() => { })
+    this.syncHistory(chatId, { timeoutMs: 0 }).catch(() => { })
   }
 
   // ===== Mídia =====
@@ -1116,12 +1252,49 @@ class BaileysClient extends EventEmitter {
     return chat
   }
 
-  async syncHistory (chatId) {
-    const list = this.store.listMessages(chatId)
-    const oldest = list[0]
-    if (!oldest) return false
-    await this._sock().fetchMessageHistory(50, oldest.key, oldest.messageTimestamp)
-    return true
+  /**
+   * Pede ao celular mensagens anteriores à mais antiga já guardada (HISTORY_SYNC_ON_DEMAND).
+   * A resposta chega como messaging-history.set syncType ON_DEMAND; espera até o timeout para o
+   * fetchMessages seguinte do CRM já enxergar as mensagens novas.
+   */
+  async syncHistory (chatId, options = {}) {
+    if (!this.sock || this.state !== 'CONNECTED') {
+      throw new HistorySyncError('history_sync_not_connected', 422)
+    }
+    const count = Number(options.count) > 0 ? Math.floor(Number(options.count)) : 50
+    const canonical = this.store.canonicalChatId(toBaileysJid(chatId))
+    const oldest = this.store.listMessages(canonical).find((m) => m?.key?.id && m.key.remoteJid)
+    if (!oldest) {
+      return { success: true, message: 'history_sync_waiting_initial' }
+    }
+    const key = { remoteJid: oldest.key.remoteJid, id: oldest.key.id, fromMe: !!oldest.key.fromMe }
+    const timeoutMs = Number(options.timeoutMs ?? this.options.historyOnDemandTimeoutMs ?? 15000)
+    const waiter = this._waitOnDemand(canonical, timeoutMs)
+    let requestId
+    try {
+      requestId = await this.sock.fetchMessageHistory(count, key, toNumber(oldest.messageTimestamp))
+    } catch (err) {
+      waiter.resolve(null)
+      throw err
+    }
+    waiter.requestId = requestId || null
+    const result = await waiter.promise
+    if (!result) {
+      // Pedido aceito; a resposta do celular ainda não chegou (o store recebe quando chegar).
+      return { success: true, syncType: 'ON_DEMAND', progress: null, isLatest: false, pending: true, requestId: requestId || null, count }
+    }
+    return { success: true, syncType: result.syncType, progress: result.progress, isLatest: result.isLatest, received: result.received, requestId: requestId || null, count }
+  }
+
+  /** flag true mantém syncFullHistory; false desliga nas próximas conexões sem apagar o que já chegou. */
+  async setBackgroundSync (flag) {
+    this.backgroundSync = flag !== false && flag !== 'false'
+    this.options.syncFullHistory = this.backgroundSync
+    return this.backgroundSync
+  }
+
+  getHistorySyncState () {
+    return { ...this.historyState, status: { ...this.historyStatus }, backgroundSync: this.backgroundSync }
   }
 
   async sendPresenceAvailable () {
@@ -1197,11 +1370,11 @@ class BaileysClient extends EventEmitter {
 const UNSUPPORTED_CLIENT_METHODS = [
   'getCommonGroups', 'getLabels', 'getLabelById', 'getChatLabels', 'getChatsByLabelId', 'addOrRemoveLabels',
   'getContactDeviceCount', 'getCountryCode', 'getFormattedNumber', 'setAutoDownloadAudio', 'setAutoDownloadDocuments',
-  'setAutoDownloadPhotos', 'setAutoDownloadVideos', 'resetState', 'setBackgroundSync', 'getChannels',
+  'setAutoDownloadPhotos', 'setAutoDownloadVideos', 'resetState', 'getChannels',
   'getChannelByInviteCode', 'createChannel', 'subscribeToChannel', 'unsubscribeFromChannel', 'searchChannels'
 ]
 for (const name of UNSUPPORTED_CLIENT_METHODS) {
   BaileysClient.prototype[name] = async function () { throw new NotSupportedError(`client.${name}`) }
 }
 
-module.exports = { BaileysClient, BaileysChat, BaileysMessage, BaileysContact, DisconnectCode, lightContent }
+module.exports = { BaileysClient, BaileysChat, BaileysMessage, BaileysContact, DisconnectCode, HistorySyncError, lightContent, historySyncTypeName }

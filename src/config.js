@@ -31,8 +31,16 @@ const wwebjsBrowserMarker = /^[a-zA-Z0-9_-]{4,128}$/.test(rawWwebjsBrowserMarker
 const baileysLogLevel = process.env.BAILEYS_LOG_LEVEL || 'warn'
 // Baileys: buscar a versão mais recente do WhatsApp Web ao conectar (padrão true; false usa a versão embutida no pacote)
 const baileysFetchLatestVersion = (process.env.BAILEYS_FETCH_LATEST_VERSION || 'true').toLowerCase() === 'true'
-// Baileys: pedir histórico completo no pareamento (padrão false = só o histórico recente)
-const baileysSyncFullHistory = (process.env.BAILEYS_SYNC_FULL_HISTORY || 'false').toLowerCase() === 'true'
+// Baileys: histórico completo no pareamento (padrão true, nível mais completo da doc advanced/history-sync)
+const baileysSyncFullHistory = (process.env.BAILEYS_SYNC_FULL_HISTORY || 'true').toLowerCase() === 'true'
+// Mensagem nova vinda do histórico só vira webhook se tiver até N segundos (padrão 900; 0 = nunca; -1 = sem limite).
+// O ingest trata webhook "message" como ao vivo (chatbot/notificação); o resto chega ao CRM pelo fetchMessages.
+const baileysHistoryWebhookMaxAgeSeconds = parseInt(process.env.BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS ?? '900', 10)
+// Quanto POST /chat/syncHistory espera a resposta ON_DEMAND do celular (padrão 15s, abaixo do timeout HTTP do CRM)
+const baileysHistoryOnDemandTimeoutMs = Math.max(0, parseInt(process.env.BAILEYS_HISTORY_ON_DEMAND_TIMEOUT_MS || '15000', 10))
+// Mensagens por chat no store: em memória e persistidas em floume-store.json
+const baileysStoreMaxMessagesPerChat = Math.max(50, parseInt(process.env.BAILEYS_STORE_MAX_MESSAGES_PER_CHAT || '500', 10))
+const baileysStorePersistMessagesPerChat = Math.max(20, parseInt(process.env.BAILEYS_STORE_PERSIST_MESSAGES_PER_CHAT || '200', 10))
 // Mantido só para a limpeza de Chrome órfão deixado pela versão antiga (whatsapp-web.js)
 const cleanupOrphanBrowsersOnStartup = (process.env.CLEANUP_ORPHAN_BROWSERS_ON_STARTUP || 'true').toLowerCase() === 'true'
 
@@ -59,5 +67,9 @@ module.exports = {
   cleanupOrphanBrowsersOnStartup,
   baileysLogLevel,
   baileysFetchLatestVersion,
-  baileysSyncFullHistory
+  baileysSyncFullHistory,
+  baileysHistoryWebhookMaxAgeSeconds,
+  baileysHistoryOnDemandTimeoutMs,
+  baileysStoreMaxMessagesPerChat,
+  baileysStorePersistMessagesPerChat
 }

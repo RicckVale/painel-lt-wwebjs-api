@@ -1,5 +1,6 @@
 const { MessageMedia, Location, Poll } = require('../baileys/structures')
 const { sessions } = require('../sessions')
+const { syncHistoryHandler } = require('./historySync')
 const { sendErrorResponse, sendNotSupported } = require('../utils')
 
 /**
@@ -1619,14 +1620,8 @@ const syncHistory = async (req, res) => {
       },
     }
   */
-  try {
-    const { chatId } = req.body
-    const client = sessions.get(req.params.sessionId)
-    const result = await client.syncHistory(chatId)
-    res.json({ success: true, result })
-  } catch (error) {
-    sendErrorResponse(res, 500, error.message)
-  }
+  // Mesmo caminho nas duas rotas: fetchMessageHistory a partir da mensagem mais antiga guardada.
+  return syncHistoryHandler(req, res)
 }
 
 /**

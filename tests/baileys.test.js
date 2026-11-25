@@ -47,7 +47,8 @@ jest.mock('../src/baileys/loader', () => ({
       state: { creds: { registered: false }, keys: {} },
       saveCreds: jest.fn(async () => { })
     }),
-    downloadMediaMessage: async () => Buffer.from('conteudo-do-arquivo')
+    downloadMediaMessage: async () => Buffer.from('conteudo-do-arquivo'),
+    Browsers: { macOS: (name) => ['Mac OS', name, '14.4.1'], ubuntu: (name) => ['Ubuntu', name, '22.04.4'] }
   })
 }))
 
@@ -394,5 +395,151 @@ describe('Pairing code', () => {
     expect(sock.logout).not.toHaveBeenCalled()
     expect(sessions.has('sessao-b')).toBe(false)
     expect(fs.existsSync(path.join(process.env.SESSIONS_PATH, 'baileys-sessao-b'))).toBe(true)
+  })
+})
+
+describe('Sincronização de histórico (messaging-history.set e fetchMessageHistory)', () => {
+  const now = () => Math.floor(Date.now() / 1000)
+  const chatJid = '5511922221111@s.whatsapp.net'
+  const chatId = '5511922221111@c.us'
+  let base
+
+  it('socket nasce com syncFullHistory, shouldSyncHistoryMessage true e perfil macOS Desktop', async () => {
+    await request(app).get('/session/start/sessao-h').set(KEY).expect(202)
+    const sock = await socketOf('sessao-h')
+    expect(sock.opts.syncFullHistory).toBe(true)
+    for (const syncType of [0, 1, 2, 3, 4, 5, 6]) {
+      expect(sock.opts.shouldSyncHistoryMessage({ syncType })).toBe(true)
+    }
+    expect(sock.opts.browser).toEqual(['Mac OS', 'Desktop', '14.4.1'])
+  })
+
+  it('desconectado: as duas rotas respondem 422 history_sync_not_connected', async () => {
+    const sock = await socketOf('sessao-h')
+    sock.ev.emit('connection.update', { qr: '2@QR-H' })
+    for (const route of ['/chat/syncHistory/sessao-h', '/client/syncHistory/sessao-h']) {
+      const res = await request(app).post(route).set(KEY).send({ chatId })
+      expect(res.status).toBe(422)
+      expect(res.body).toEqual({ success: false, error: 'history_sync_not_connected', message: 'history_sync_not_connected' })
+    }
+    expect(sock.fetchMessageHistory).not.toHaveBeenCalled()
+  })
+
+  it('chat sem mensagem guardada responde history_sync_waiting_initial', async () => {
+    const sock = await socketOf('sessao-h')
+    sock.ev.emit('connection.update', { connection: 'open' })
+    const res = await request(app).post('/chat/syncHistory/sessao-h').set(KEY).send({ chatId })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ success: true, message: 'history_sync_waiting_initial' })
+    expect(sock.fetchMessageHistory).not.toHaveBeenCalled()
+  })
+
+  it('messaging-history.set com 2 mensagens e uma repetida grava 2 e o webhook sai uma vez por id', async () => {
+    const sock = await socketOf('sessao-h')
+    base = now()
+    const m1 = { key: { remoteJid: chatJid, fromMe: false, id: 'HIST-IN-1' }, pushName: 'Cliente H', messageTimestamp: base - 120, message: { conversation: 'mensagem antiga recebida' } }
+    const m2 = { key: { remoteJid: chatJid, fromMe: true, id: 'HIST-OUT-2' }, messageTimestamp: base - 60, message: { conversation: 'resposta da loja' } }
+    const payload = {
+      chats: [{ id: chatJid, name: 'Cliente H', conversationTimestamp: base - 60, unreadCount: 1 }],
+      contacts: [{ id: chatJid, notify: 'Cliente H' }],
+      messages: [m2, m1, { ...m1 }],
+      isLatest: false,
+      progress: 40,
+      syncType: 0
+    }
+    sock.ev.emit('messaging-history.set', payload)
+    sock.ev.emit('messaging-history.set', payload)
+    await sessions.get('sessao-h').historyQueue
+
+    const fetched = await request(app).post('/chat/fetchMessages/sessao-h').set(KEY).send({ chatId, searchOptions: { limit: 50 } })
+    expect(fetched.body.messages.map((m) => m.id.id)).toEqual(['HIST-IN-1', 'HIST-OUT-2'])
+    expect(fetched.body.messages[0].from).toBe(chatId)
+
+    const inHooks = webhooksOf('message').filter((c) => c.body.data.message.id.id === 'HIST-IN-1')
+    const outHooks = webhooksOf('message_create').filter((c) => c.body.data.message.id.id === 'HIST-OUT-2')
+    expect(inHooks).toHaveLength(1)
+    expect(outHooks).toHaveLength(1)
+    expect(inHooks[0].body.sessionId).toBe('sessao-h')
+    expect(inHooks[0].body.data.message._data.id.remote).toBe(chatId)
+    expect(inHooks[0].body.data.message._data.notifyName).toBe('Cliente H')
+
+    const chats = await request(app).get('/client/getChats/sessao-h').set(KEY)
+    expect(chats.body.chats.find((c) => c.id._serialized === chatId).name).toBe('Cliente H')
+    expect(sessions.get('sessao-h').getHistorySyncState()).toMatchObject({ syncType: 'INITIAL_BOOTSTRAP', progress: 40, isLatest: false })
+  })
+
+  it('mensagem antiga do histórico vai para o store mas não vira webhook (não aciona chatbot)', async () => {
+    const sock = await socketOf('sessao-h')
+    sock.ev.emit('messaging-history.set', {
+      chats: [],
+      contacts: [],
+      messages: [{ key: { remoteJid: '5511911110000@s.whatsapp.net', fromMe: false, id: 'HIST-OLD' }, messageTimestamp: now() - 3 * 86400, message: { conversation: 'de três dias atrás' } }],
+      syncType: 2,
+      progress: 80,
+      isLatest: false
+    })
+    await sessions.get('sessao-h').historyQueue
+    const fetched = await request(app).post('/chat/fetchMessages/sessao-h').set(KEY).send({ chatId: '5511911110000@c.us', searchOptions: { limit: 10 } })
+    expect(fetched.body.messages.map((m) => m.id.id)).toEqual(['HIST-OLD'])
+    expect(mockWebhookCalls.some((c) => c.body.data?.message?.id?.id === 'HIST-OLD')).toBe(false)
+  })
+
+  it('chat @lid sem telefone conhecido devolve o id no formato antigo (@lid)', async () => {
+    const sock = await socketOf('sessao-h')
+    sock.ev.emit('messaging-history.set', {
+      chats: [],
+      contacts: [],
+      messages: [{ key: { remoteJid: '7770001112223@lid', fromMe: false, id: 'HIST-LID' }, messageTimestamp: now() - 30, message: { conversation: 'oi lid' } }],
+      syncType: 3
+    })
+    await sessions.get('sessao-h').historyQueue
+    const fetched = await request(app).post('/chat/fetchMessages/sessao-h').set(KEY).send({ chatId: '7770001112223@lid', searchOptions: { limit: 10 } })
+    expect(fetched.body.messages[0].id._serialized).toBe('false_7770001112223@lid_HIST-LID')
+    const hook = webhooksOf('message').find((c) => c.body.data.message.id.id === 'HIST-LID')
+    expect(hook.body.data.message.from).toBe('7770001112223@lid')
+  })
+
+  it('POST /chat/syncHistory chama fetchMessageHistory com a chave mais antiga e devolve syncType, progress e isLatest', async () => {
+    const sock = await socketOf('sessao-h')
+    sock.fetchMessageHistory.mockImplementationOnce(async () => {
+      setImmediate(() => sock.ev.emit('messaging-history.set', {
+        chats: [],
+        contacts: [],
+        messages: [{ key: { remoteJid: chatJid, fromMe: false, id: 'HIST-OLDER-0' }, messageTimestamp: base - 86400, message: { conversation: 'mais antiga ainda' } }],
+        syncType: 6,
+        progress: 100,
+        isLatest: true,
+        peerDataRequestSessionId: 'pdo-1'
+      }))
+      return 'pdo-1'
+    })
+    const res = await request(app).post('/chat/syncHistory/sessao-h').set(KEY).send({ chatId, count: 30 })
+    expect(res.status).toBe(200)
+    expect(res.body).toEqual({ success: true, syncType: 'ON_DEMAND', progress: 100, isLatest: true, received: 1, requestId: 'pdo-1', count: 30 })
+    expect(sock.fetchMessageHistory).toHaveBeenCalledWith(30, { remoteJid: chatJid, id: 'HIST-IN-1', fromMe: false }, base - 120)
+
+    const fetched = await request(app).post('/chat/fetchMessages/sessao-h').set(KEY).send({ chatId, searchOptions: { limit: 50 } })
+    expect(fetched.body.messages.map((m) => m.id.id)).toEqual(['HIST-OLDER-0', 'HIST-IN-1', 'HIST-OUT-2'])
+  })
+
+  it('POST /client/syncHistory segue o mesmo caminho (count padrão 50, nova chave mais antiga)', async () => {
+    const sock = await socketOf('sessao-h')
+    sock.fetchMessageHistory.mockImplementationOnce(async () => {
+      setImmediate(() => sock.ev.emit('messaging-history.set', { chats: [], contacts: [], messages: [], syncType: 6, progress: 100, isLatest: true, peerDataRequestSessionId: 'pdo-2' }))
+      return 'pdo-2'
+    })
+    const res = await request(app).post('/client/syncHistory/sessao-h').set(KEY).send({ chatId, count: 'abc' })
+    expect(res.status).toBe(200)
+    expect(res.body).toMatchObject({ success: true, syncType: 'ON_DEMAND', progress: 100, isLatest: true, received: 0, count: 50 })
+    expect(sock.fetchMessageHistory).toHaveBeenLastCalledWith(50, { remoteJid: chatJid, id: 'HIST-OLDER-0', fromMe: false }, base - 86400)
+  })
+
+  it('setBackgroundSync: false desliga nas próximas conexões sem apagar o store; true volta', async () => {
+    const client = sessions.get('sessao-h')
+    await request(app).post('/client/setBackgroundSync/sessao-h').set(KEY).send({ flag: false }).expect(200)
+    expect(client.getHistorySyncState().backgroundSync).toBe(false)
+    expect(client.store.listMessages(chatId)).toHaveLength(3)
+    await request(app).post('/client/setBackgroundSync/sessao-h').set(KEY).send({ flag: true }).expect(200)
+    expect(client.getHistorySyncState().backgroundSync).toBe(true)
   })
 })

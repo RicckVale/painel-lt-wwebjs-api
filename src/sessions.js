@@ -5,7 +5,10 @@ const fs = require('fs')
 const path = require('path')
 const sessions = new Map()
 const sessionLocks = new Map()
-const { baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, baileysLogLevel, baileysFetchLatestVersion, baileysSyncFullHistory } = require('./config')
+const {
+  baseWebhookURL, sessionFolderPath, maxAttachmentSize, setMessagesAsSeen, baileysLogLevel, baileysFetchLatestVersion, baileysSyncFullHistory,
+  baileysHistoryWebhookMaxAgeSeconds, baileysHistoryOnDemandTimeoutMs, baileysStoreMaxMessagesPerChat, baileysStorePersistMessagesPerChat
+} = require('./config')
 const { triggerWebhook, isEventEnabled, sendMessageSeenStatus, sleep } = require('./utils')
 const { logger } = require('./logger')
 const { initWebSocketServer, terminateWebSocketServer, triggerWebSocket } = require('./websocket')
@@ -113,7 +116,11 @@ const setupSession = async (sessionId) => {
       options: {
         logLevel: baileysLogLevel,
         fetchLatestVersion: baileysFetchLatestVersion,
-        syncFullHistory: baileysSyncFullHistory
+        syncFullHistory: baileysSyncFullHistory,
+        historyWebhookMaxAgeSeconds: baileysHistoryWebhookMaxAgeSeconds,
+        historyOnDemandTimeoutMs: baileysHistoryOnDemandTimeoutMs,
+        storeMaxMessagesPerChat: baileysStoreMaxMessagesPerChat,
+        storePersistMessagesPerChat: baileysStorePersistMessagesPerChat
       }
     })
     sessions.set(sessionId, client)
