@@ -8,8 +8,25 @@ Registro do script npm que não faz parte do produto WhatsApp. O detalhe do inci
 
 Instalação deste repositório continua com `npm install --ignore-scripts`.
 
+## Baileys (desde 24/11/2026)
+
+`@whiskeysockets/baileys` fica pinado em versão exata (`7.0.0-rc14`), sem `^` e sem Git. Nenhuma dependência do motor precisa de script de instalação, então `--ignore-scripts` não quebra nada:
+
+- `whatsapp-rust-bridge` é wasm pronto.
+- `libsignal` 6 é JS puro.
+- `sharp` usa binários `@img/*` opcionais.
+
+Os scripts que existem na árvore são benignos e ficam ignorados:
+
+- `preinstall` do Baileys: só checa Node ≥ 20.
+- `postinstall` do `protobufjs`.
+- `@scarf/scarf`: telemetria do `swagger-ui-dist`, já existia.
+
+Puppeteer e whatsapp-web.js saíram da árvore.
+
 ## Histórico de Modificações Recentes
 
+- `../2026/11/semana-48/24112026_implementacao_baileys.md`
 - `../2026/11/semana-46/12112026_melhoria_audit_jest_swagger.md`
 - `../2026/11/semana-45/06112026_melhoria_npm_audit_transitivas.md`
 - `../2026/11/semana-45/02112026_seguranca_postinstall-malicioso.md`
