@@ -43,8 +43,12 @@ jest.mock('../src/baileys/loader', () => ({
       mockSockets.push(sock)
       return sock
     },
-    useMultiFileAuthState: async () => ({
-      state: { creds: { registered: false }, keys: {} },
+    // Pastas de sessão "pareada" (sessao-h, sessao-pareada) já têm credencial: creds.me preenchido no QR.
+    useMultiFileAuthState: async (dir) => ({
+      state: {
+        creds: /sessao-h$|pareada/.test(dir) ? { registered: false, me: { id: '5511900000000:9@s.whatsapp.net' } } : { registered: false },
+        keys: {}
+      },
       saveCreds: jest.fn(async () => { })
     }),
     downloadMediaMessage: async () => Buffer.from('conteudo-do-arquivo'),
@@ -398,13 +402,38 @@ describe('Pairing code', () => {
   })
 })
 
+describe('syncFullHistory na primeira conexão x sessão pareada', () => {
+  it('socket sem credencial pareada nasce com syncFullHistory false (QR sai)', async () => {
+    await request(app).get('/session/start/sessao-nova').set(KEY).expect(202)
+    const sock = await socketOf('sessao-nova')
+    expect(sock.opts.syncFullHistory).toBe(false)
+    expect(sock.opts.shouldSyncHistoryMessage({ syncType: 2 })).toBe(true)
+  })
+
+  it('depois de ler o QR, a reconexão (515) já sobe com syncFullHistory true', async () => {
+    const first = await socketOf('sessao-nova')
+    first.ev.emit('connection.update', { qr: '2@QR-NOVA' })
+    first.ev.emit('connection.update', { connection: 'open' })
+    first.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { message: 'Stream Errored (restart required)', output: { statusCode: 515 } } } })
+    const second = await waitFor(() => (sessions.get('sessao-nova').sock !== first ? sessions.get('sessao-nova').sock : null))
+    expect(second.opts.syncFullHistory).toBe(true)
+  })
+
+  it('socket com credencial pareada nasce com syncFullHistory true', async () => {
+    await request(app).get('/session/start/sessao-pareada').set(KEY).expect(202)
+    const sock = await socketOf('sessao-pareada')
+    expect(sock.opts.syncFullHistory).toBe(true)
+    expect(sock.opts.shouldSyncHistoryMessage({ syncType: 6 })).toBe(true)
+  })
+})
+
 describe('Sincronização de histórico (messaging-history.set e fetchMessageHistory)', () => {
   const now = () => Math.floor(Date.now() / 1000)
   const chatJid = '5511922221111@s.whatsapp.net'
   const chatId = '5511922221111@c.us'
   let base
 
-  it('socket nasce com syncFullHistory, shouldSyncHistoryMessage true e perfil macOS Desktop', async () => {
+  it('sessão pareada: socket nasce com syncFullHistory, shouldSyncHistoryMessage true e perfil macOS Desktop', async () => {
     await request(app).get('/session/start/sessao-h').set(KEY).expect(202)
     const sock = await socketOf('sessao-h')
     expect(sock.opts.syncFullHistory).toBe(true)

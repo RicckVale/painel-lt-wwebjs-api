@@ -519,7 +519,9 @@ class BaileysClient extends EventEmitter {
       markOnlineOnConnect: false,
       // Nível mais completo da doc do Baileys (advanced/history-sync): syncFullHistory + perfil macOS Desktop,
       // sem descartar nenhum tipo de sync (INITIAL_BOOTSTRAP, RECENT, FULL, ON_DEMAND, NON_BLOCKING_DATA...).
-      syncFullHistory: this.backgroundSync,
+      // Primeira conexão (sem pareamento) sobe com syncFullHistory false: com true + "Desktop" o Baileys se
+      // anuncia como app nativo (webSubPlatform DARWIN/WIN32) e o WhatsApp fecha com 428 antes do QR.
+      syncFullHistory: this.socketSyncFullHistory(),
       shouldSyncHistoryMessage: () => true,
       generateHighQualityLinkPreview: false,
       getMessage: async (key) => {
@@ -530,6 +532,7 @@ class BaileysClient extends EventEmitter {
     }
     if (b.Browsers && typeof b.Browsers.macOS === 'function') socketOptions.browser = b.Browsers.macOS('Desktop')
     if (this.baileysVersion) socketOptions.version = this.baileysVersion
+    this.lastSocketSyncFullHistory = socketOptions.syncFullHistory
     const sock = b.makeWASocket(socketOptions)
     this.sock = sock
     this._bindSocket(sock)
@@ -587,7 +590,7 @@ class BaileysClient extends EventEmitter {
       this.emit('qr', qr)
     }
     if (connection === 'connecting' && !this.qr) {
-      this._setState(this.connectedOnce || this.authState?.creds?.registered ? 'OPENING' : 'STARTING')
+      this._setState(this.isRegistered() ? 'OPENING' : 'STARTING')
     }
     if (connection === 'open') {
       this.qr = null
@@ -624,6 +627,12 @@ class BaileysClient extends EventEmitter {
     const code = err?.output?.statusCode ?? err?.statusCode ?? null
     if (this.destroyed) return
     this.qr = null
+    // Só a message do Boom/erro (ex.: "Connection Terminated"); nunca credencial nem QR.
+    const reason = String(err?.message || '').slice(0, 200) || null
+    const terminalCodes = [DisconnectCode.loggedOut, DisconnectCode.connectionReplaced, DisconnectCode.forbidden, DisconnectCode.multideviceMismatch]
+    if (terminalCodes.includes(code)) {
+      logger.warn({ sessionId: this.sessionId, code, reason }, 'Conexão Baileys encerrada sem reconexão')
+    }
     if (code === DisconnectCode.loggedOut) {
       this.loggedOut = true
       this.terminal = true
@@ -661,7 +670,7 @@ class BaileysClient extends EventEmitter {
       this._setState('STARTING')
     }
     const delay = Math.min(1000 * (2 ** Math.min(this.reconnectAttempts - 1, 5)), MAX_RECONNECT_DELAY_MS)
-    logger.warn({ sessionId: this.sessionId, code, delay, attempt: this.reconnectAttempts }, 'Conexão Baileys fechada; reconectando')
+    logger.warn({ sessionId: this.sessionId, code, reason, delay, attempt: this.reconnectAttempts, syncFullHistory: this.lastSocketSyncFullHistory }, 'Conexão Baileys fechada; reconectando')
     this._scheduleReconnect(delay)
   }
 
@@ -719,7 +728,14 @@ class BaileysClient extends EventEmitter {
 
   /** Sessão já pareada (creds registradas) — usada para não apagar credencial de quem só está reconectando. */
   isRegistered () {
-    return !!this.authState?.creds?.registered || this.connectedOnce
+    // No pareamento por QR o Baileys preenche creds.me (registered só vira true no código de pareamento).
+    const creds = this.authState?.creds
+    return !!(creds?.registered || creds?.me?.id) || this.connectedOnce
+  }
+
+  /** syncFullHistory do próximo socket: false até parear; depois, BAILEYS_SYNC_FULL_HISTORY / setBackgroundSync. */
+  socketSyncFullHistory () {
+    return this.isRegistered() ? this.backgroundSync : false
   }
 
   async getState () {
@@ -1351,7 +1367,7 @@ class BaileysClient extends EventEmitter {
   async requestPairingCode (phoneNumber) {
     const digits = phoneDigits(phoneNumber)
     if (!digits) throw new Error('phoneNumber is required')
-    if (this.state === 'CONNECTED' || this.authState?.creds?.registered) {
+    if (this.state === 'CONNECTED' || this.isRegistered()) {
       throw new Error('session already paired')
     }
     // O socket precisa estar aberto (primeiro QR emitido) para aceitar o pedido de código.
