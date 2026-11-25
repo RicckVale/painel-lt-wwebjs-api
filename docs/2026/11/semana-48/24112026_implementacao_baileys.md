@@ -99,7 +99,7 @@ Respondem `501 { success: false, error: 'not_supported_by_baileys', message: 'no
 - etiquetas: `getLabels`, `getChatLabels`, `changeLabels`, `addOrRemoveLabels`, `getChatsByLabelId`, `getLabelById`
 - canais (`@newsletter`)
 - `getCommonGroups`, `getCountryCode`, `getFormattedNumber` (client), `getContactDeviceCount`
-- `setAutoDownload*`, `resetState`, `setBackgroundSync`
+- `setAutoDownload*`, `resetState`. O `setBackgroundSync` passou a ser implementado no complemento de histórico; não é 501.
 - `message.getInfo`, `getOrder`, `getPayment`, `getReactions`, `getPollVotes`
 
 A API Nest (`api/src/wwebjs/*`) **não mudou**.
@@ -164,7 +164,7 @@ Referência: https://baileys.wiki/pt-BR/advanced/history-sync. A versão em ingl
 
 ### Socket
 
-- `syncFullHistory: true`, que fica `false` só se `BAILEYS_SYNC_FULL_HISTORY=false` ou depois de `setBackgroundSync` com flag `false`.
+- `syncFullHistory: true`, que fica `false` se `BAILEYS_SYNC_FULL_HISTORY=false`, depois de `setBackgroundSync` com flag `false` e, desde a correção abaixo, na primeira conexão sem pareamento.
 - `shouldSyncHistoryMessage: () => true`. Nenhum tipo é descartado: INITIAL_BOOTSTRAP, INITIAL_STATUS_V3, FULL, RECENT, PUSH_NAME, NON_BLOCKING_DATA e ON_DEMAND.
 - `browser: Browsers.macOS('Desktop')`. No celular, o aparelho vinculado aparece como Mac/Desktop.
 - Também é escutado `messaging-history.status` (complete/paused por tipo). O estado fica em `client.getHistorySyncState()`.
@@ -232,3 +232,50 @@ As duas rotas seguem o mesmo caminho (`src/controllers/historySync.js`). Saiu o 
    ```
 
    A resposta esperada é `{ success: true, syncType: 'ON_DEMAND', progress, isLatest }`. Em seguida, `fetchMessages` do mesmo chat deve trazer as mensagens mais antigas.
+
+## Correção (25/11/2026): QR não saía em produção
+
+### Sintoma
+
+Em produção (commit 8f665ee), na sessão `f28787ad-…`:
+
+- `GET /session/start` respondeu `session_initialization_started`.
+- Cerca de 1 s depois o socket fechou com code 428 e entrou em reconexão; o estado ficou em `STARTING`.
+- `GET /session/qr` respondeu `qr code not ready or already scanned`.
+
+### Causa
+
+Reproduzida com o Baileys real, credencial nova e pasta temporária no mesmo host:
+
+| Socket da primeira conexão | Resultado |
+| --- | --- |
+| `syncFullHistory: true` + `Windows/Desktop` | 428 "Connection Terminated" antes do QR, em 3 de 3 tentativas |
+| `syncFullHistory: true` + `Mac OS/Desktop` | 428 em 2 tentativas seguidas; depois passou em outras |
+| `Ubuntu/Chrome`, `Mac OS/Chrome`, `Ubuntu/Desktop` | QR em cerca de 1,5 s |
+| `syncFullHistory: false` + `Mac OS/Desktop` | QR em 4 de 4 |
+
+O mecanismo está em `Utils/validate-connection.js` do Baileys 7.0.0-rc14. Quando `syncFullHistory` é true e o browser é `Mac OS`/`Windows` + `Desktop`, o `webSubPlatform` do ClientPayload vira DARWIN/WIN32: o Baileys se anuncia como app nativo de desktop. Com credencial nova, o WhatsApp fecha a conexão (428) antes de mandar o `pair-device` com o QR.
+
+### Ajuste
+
+- Sem pareamento, o socket sobe com `syncFullHistory: false`. "Sem pareamento" quer dizer sem `creds.me`, sem `creds.registered` e sem conexão aberta antes. O login vai como `WEB_BROWSER` e o QR sai.
+- Pareada, a partir da reconexão 515 logo depois de ler o QR: usa `BAILEYS_SYNC_FULL_HISTORY` (padrão `true`) ou o último `setBackgroundSync`.
+- `shouldSyncHistoryMessage` continua `true` e o store não é apagado.
+- `isRegistered()` passa a considerar `creds.me`. No pareamento por QR o Baileys não marca `creds.registered`; isso só acontece no código de pareamento.
+- O log de queda inclui `reason`, a message do erro (ex.: `"Connection Terminated"`), além de `code` e do `syncFullHistory` do socket. Não leva credencial nem QR.
+- Depois do ajuste, o mesmo teste real gerou QR também com `Windows/Desktop` (2 de 2) e `Mac OS/Desktop` (2 de 2).
+
+### Efeito colateral
+
+O Baileys só envia o pedido de histórico completo (`requireFullSync`) no registro do aparelho, que é a conexão do QR. Pareando com `false`, o celular manda o histórico padrão do pareamento, não o completo. O histórico mais antigo continua chegando pelo `syncHistory` sob demanda (`fetchMessageHistory`) por chat.
+
+As reconexões da sessão pareada usam `syncFullHistory: true` com `Mac OS/Desktop`, ou seja, o login se anuncia como DARWIN. Se o 428 voltar a aparecer em sessão já pareada, o log agora mostra `reason` e `syncFullHistory`. Nesse caso, o próximo passo é trocar o browser para `Browsers.macOS('Chrome')`, que deu QR em todos os testes.
+
+### Como conferir
+
+1. `npm test` → 45 testes verdes. Os novos provam:
+   - socket sem credencial pareada nasce com `syncFullHistory: false`
+   - depois do QR, a reconexão 515 sobe com `true`
+   - socket com credencial pareada nasce com `true`
+   - o bloco de histórico completo continua valendo para a sessão pareada
+2. Em produção, depois do deploy e do restart (feitos pelo maestro): `GET /session/start/<id>`, e em poucos segundos `GET /session/qr/<id>` deve responder `{ success: true, qr }`. O log não deve ter 428 antes do QR.
