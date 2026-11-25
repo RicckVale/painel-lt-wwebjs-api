@@ -31,8 +31,9 @@ const wwebjsBrowserMarker = /^[a-zA-Z0-9_-]{4,128}$/.test(rawWwebjsBrowserMarker
 const baileysLogLevel = process.env.BAILEYS_LOG_LEVEL || 'warn'
 // Baileys: buscar a versão mais recente do WhatsApp Web ao conectar (padrão true; false usa a versão embutida no pacote)
 const baileysFetchLatestVersion = (process.env.BAILEYS_FETCH_LATEST_VERSION || 'true').toLowerCase() === 'true'
-// Baileys: histórico completo no pareamento (padrão true, nível mais completo da doc advanced/history-sync)
-const baileysSyncFullHistory = (process.env.BAILEYS_SYNC_FULL_HISTORY || 'true').toLowerCase() === 'true'
+// Baileys: histórico completo (syncFullHistory + perfil macOS Desktop). Padrão false: o histórico é sob demanda
+// (fetchMessageHistory). Com true + Desktop o WhatsApp fechou a reconexão pós-QR com 428 em produção.
+const baileysSyncFullHistory = (process.env.BAILEYS_SYNC_FULL_HISTORY || 'false').toLowerCase() === 'true'
 // Mensagem nova vinda do histórico só vira webhook se tiver até N segundos (padrão 900; 0 = nunca; -1 = sem limite).
 // O ingest trata webhook "message" como ao vivo (chatbot/notificação); o resto chega ao CRM pelo fetchMessages.
 const baileysHistoryWebhookMaxAgeSeconds = parseInt(process.env.BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS ?? '900', 10)

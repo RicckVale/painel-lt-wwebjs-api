@@ -402,28 +402,80 @@ describe('Pairing code', () => {
   })
 })
 
-describe('syncFullHistory na primeira conexão x sessão pareada', () => {
-  it('socket sem credencial pareada nasce com syncFullHistory false (QR sai)', async () => {
+describe('syncFullHistory: padrão histórico sob demanda', () => {
+  const { BaileysClient } = require('../src/baileys/client')
+  const directClients = []
+  const startDirect = async (dirName, options) => {
+    const client = new BaileysClient({ sessionId: dirName, authDir: path.join(process.env.SESSIONS_PATH, dirName), options: { fetchLatestVersion: false, ...options } })
+    directClients.push(client)
+    await client.initialize()
+    return client
+  }
+  const closeWith = (sock, error) => sock.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error } })
+  const nextSocket = (sessionId, previous) => waitFor(() => (sessions.get(sessionId).sock !== previous ? sessions.get(sessionId).sock : null))
+
+  afterAll(async () => {
+    for (const c of directClients) await c.destroy().catch(() => { })
+  })
+
+  it('socket sem parear nasce com syncFullHistory false e perfil web macOS Chrome (env padrão)', async () => {
     await request(app).get('/session/start/sessao-nova').set(KEY).expect(202)
     const sock = await socketOf('sessao-nova')
     expect(sock.opts.syncFullHistory).toBe(false)
-    expect(sock.opts.shouldSyncHistoryMessage({ syncType: 2 })).toBe(true)
+    expect(sock.opts.browser).toEqual(['Mac OS', 'Chrome', '14.4.1'])
+    for (const syncType of [0, 3, 6]) expect(sock.opts.shouldSyncHistoryMessage({ syncType })).toBe(true)
   })
 
-  it('depois de ler o QR, a reconexão (515) já sobe com syncFullHistory true', async () => {
-    const first = await socketOf('sessao-nova')
-    first.ev.emit('connection.update', { qr: '2@QR-NOVA' })
-    first.ev.emit('connection.update', { connection: 'open' })
-    first.ev.emit('connection.update', { connection: 'close', lastDisconnect: { error: { message: 'Stream Errored (restart required)', output: { statusCode: 515 } } } })
-    const second = await waitFor(() => (sessions.get('sessao-nova').sock !== first ? sessions.get('sessao-nova').sock : null))
-    expect(second.opts.syncFullHistory).toBe(true)
-  })
-
-  it('socket com credencial pareada nasce com syncFullHistory true', async () => {
+  it('socket pareado também nasce com syncFullHistory false e Chrome quando a env é false', async () => {
     await request(app).get('/session/start/sessao-pareada').set(KEY).expect(202)
     const sock = await socketOf('sessao-pareada')
-    expect(sock.opts.syncFullHistory).toBe(true)
-    expect(sock.opts.shouldSyncHistoryMessage({ syncType: 6 })).toBe(true)
+    expect(sock.opts.syncFullHistory).toBe(false)
+    expect(sock.opts.browser).toEqual(['Mac OS', 'Chrome', '14.4.1'])
+  })
+
+  it('com a opção true e pareado, nasce com syncFullHistory true (e só então perfil Desktop)', async () => {
+    const paired = await startDirect('direto-pareada-full', { syncFullHistory: true })
+    expect(paired.sock.opts.syncFullHistory).toBe(true)
+    expect(paired.sock.opts.browser).toEqual(['Mac OS', 'Desktop', '14.4.1'])
+    const fresh = await startDirect('direto-nova-full', { syncFullHistory: true })
+    expect(fresh.sock.opts.syncFullHistory).toBe(false)
+    expect(fresh.sock.opts.browser).toEqual(['Mac OS', 'Chrome', '14.4.1'])
+  })
+
+  it('fechamento 515 depois do QR agenda reconexão imediata e não liga syncFullHistory', async () => {
+    const first = await socketOf('sessao-nova')
+    first.ev.emit('connection.update', { qr: '2@QR-NOVA' })
+    first.ev.emit('creds.update', { me: { id: '5511900000000:11@s.whatsapp.net' } })
+    const client = sessions.get('sessao-nova')
+    client.authState.creds.me = { id: '5511900000000:11@s.whatsapp.net' }
+    const t0 = Date.now()
+    closeWith(first, { message: 'Stream Errored (restart required)', output: { statusCode: 515 }, data: { tag: 'stream:error', attrs: { code: '515' } } })
+    const second = await nextSocket('sessao-nova', first)
+    expect(Date.now() - t0).toBeLessThan(500)
+    expect(client.reconnectAttempts).toBe(0)
+    expect(second.opts.syncFullHistory).toBe(false)
+    expect(second.opts.browser).toEqual(['Mac OS', 'Chrome', '14.4.1'])
+  })
+
+  it('515 só nos attrs do stream:error (statusCode ausente) também é restart', async () => {
+    const client = sessions.get('sessao-nova')
+    const current = client.sock
+    closeWith(current, { message: 'Stream Errored (unknown)', data: { attrs: { code: '515' } } })
+    const next = await nextSocket('sessao-nova', current)
+    expect(client.reconnectAttempts).toBe(0)
+    expect(next.opts.syncFullHistory).toBe(false)
+  })
+
+  it('428 logo após o pareamento (antes do primeiro open) é tratado como o restart pós-QR', async () => {
+    await request(app).get('/session/start/sessao-qr428').set(KEY).expect(202)
+    const first = await socketOf('sessao-qr428')
+    first.ev.emit('connection.update', { qr: '2@QR-428' })
+    first.ev.emit('creds.update', { me: { id: '5511900000000:12@s.whatsapp.net' } })
+    closeWith(first, { message: 'Connection Terminated', output: { statusCode: 428 } })
+    const second = await nextSocket('sessao-qr428', first)
+    const client = sessions.get('sessao-qr428')
+    expect(client.reconnectAttempts).toBe(0)
+    expect(second.opts.syncFullHistory).toBe(false)
   })
 })
 
@@ -433,14 +485,14 @@ describe('Sincronização de histórico (messaging-history.set e fetchMessageHis
   const chatId = '5511922221111@c.us'
   let base
 
-  it('sessão pareada: socket nasce com syncFullHistory, shouldSyncHistoryMessage true e perfil macOS Desktop', async () => {
+  it('sessão pareada: histórico sob demanda (syncFullHistory false, shouldSyncHistoryMessage true, perfil web Chrome)', async () => {
     await request(app).get('/session/start/sessao-h').set(KEY).expect(202)
     const sock = await socketOf('sessao-h')
-    expect(sock.opts.syncFullHistory).toBe(true)
+    expect(sock.opts.syncFullHistory).toBe(false)
     for (const syncType of [0, 1, 2, 3, 4, 5, 6]) {
       expect(sock.opts.shouldSyncHistoryMessage({ syncType })).toBe(true)
     }
-    expect(sock.opts.browser).toEqual(['Mac OS', 'Desktop', '14.4.1'])
+    expect(sock.opts.browser).toEqual(['Mac OS', 'Chrome', '14.4.1'])
   })
 
   it('desconectado: as duas rotas respondem 422 history_sync_not_connected', async () => {
@@ -570,5 +622,8 @@ describe('Sincronização de histórico (messaging-history.set e fetchMessageHis
     expect(client.store.listMessages(chatId)).toHaveLength(3)
     await request(app).post('/client/setBackgroundSync/sessao-h').set(KEY).send({ flag: true }).expect(200)
     expect(client.getHistorySyncState().backgroundSync).toBe(true)
+    // liga nas próximas conexões da sessão pareada; perfil segue Chrome (Desktop só com a env explícita)
+    expect(client.socketSyncFullHistory()).toBe(true)
+    expect(client.options.syncFullHistory).not.toBe(true)
   })
 })

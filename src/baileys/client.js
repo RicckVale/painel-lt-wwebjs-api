@@ -463,7 +463,10 @@ class BaileysClient extends EventEmitter {
     this.historyState = { syncType: null, progress: null, isLatest: null, chunks: 0, messages: 0, at: null }
     this.historyStatus = {}
     this.onDemandWaiters = []
-    this.backgroundSync = options.syncFullHistory !== false
+    // Histórico completo só com BAILEYS_SYNC_FULL_HISTORY=true explícito (options.syncFullHistory === true).
+    // setBackgroundSync pode ligar/desligar nas próximas conexões; o padrão é histórico sob demanda.
+    this.backgroundSync = options.syncFullHistory === true
+    this.justPaired = false
     this.pendingOwnSends = new Set()
     this.baileysVersion = null
     this.interface = {
@@ -517,10 +520,10 @@ class BaileysClient extends EventEmitter {
       auth: { creds: this.authState.creds, keys },
       logger: blogger,
       markOnlineOnConnect: false,
-      // Nível mais completo da doc do Baileys (advanced/history-sync): syncFullHistory + perfil macOS Desktop,
-      // sem descartar nenhum tipo de sync (INITIAL_BOOTSTRAP, RECENT, FULL, ON_DEMAND, NON_BLOCKING_DATA...).
-      // Primeira conexão (sem pareamento) sobe com syncFullHistory false: com true + "Desktop" o Baileys se
-      // anuncia como app nativo (webSubPlatform DARWIN/WIN32) e o WhatsApp fecha com 428 antes do QR.
+      // Padrão: histórico sob demanda. syncFullHistory false em todo socket (antes e depois do pareamento);
+      // só liga com BAILEYS_SYNC_FULL_HISTORY=true (ou setBackgroundSync(true)) e sessão já pareada.
+      // shouldSyncHistoryMessage aceita todos os tipos (INITIAL_BOOTSTRAP, RECENT, ON_DEMAND, PUSH_NAME...),
+      // que também trazem o mapa LID → telefone.
       syncFullHistory: this.socketSyncFullHistory(),
       shouldSyncHistoryMessage: () => true,
       generateHighQualityLinkPreview: false,
@@ -530,7 +533,12 @@ class BaileysClient extends EventEmitter {
       },
       cachedGroupMetadata: async (jid) => this.groupCache.get(jid)?.meta
     }
-    if (b.Browsers && typeof b.Browsers.macOS === 'function') socketOptions.browser = b.Browsers.macOS('Desktop')
+    // Perfil de cliente web recomendado pela doc do Baileys (Browsers.macOS('Chrome'), webSubPlatform WEB_BROWSER).
+    // "Desktop" anuncia app nativo (DARWIN) e só volta com BAILEYS_SYNC_FULL_HISTORY=true explícito.
+    if (b.Browsers && typeof b.Browsers.macOS === 'function') {
+      const desktop = this.options.syncFullHistory === true && socketOptions.syncFullHistory
+      socketOptions.browser = b.Browsers.macOS(desktop ? 'Desktop' : 'Chrome')
+    }
     if (this.baileysVersion) socketOptions.version = this.baileysVersion
     this.lastSocketSyncFullHistory = socketOptions.syncFullHistory
     const sock = b.makeWASocket(socketOptions)
@@ -551,7 +559,11 @@ class BaileysClient extends EventEmitter {
         logger.error({ sessionId: this.sessionId, err, event: name }, 'Falha ao processar evento do Baileys')
       }
     }
-    ev.on('creds.update', guard('creds.update', () => this.saveCreds()))
+    ev.on('creds.update', guard('creds.update', (update) => {
+      // QR lido: o Baileys grava creds.me e em seguida o servidor pede restart (515).
+      if (update?.me?.id && !this.connectedOnce) this.justPaired = true
+      return this.saveCreds()
+    }))
     ev.on('connection.update', guard('connection.update', (u) => this._onConnectionUpdate(u)))
     ev.on('messaging-history.set', guard('messaging-history.set', (h) => this._onHistory(h)))
     ev.on('messaging-history.status', guard('messaging-history.status', (st) => this._onHistoryStatus(st)))
@@ -654,8 +666,12 @@ class BaileysClient extends EventEmitter {
       this.emit('disconnected', code === DisconnectCode.forbidden ? 'FORBIDDEN' : 'MULTIDEVICE_MISMATCH')
       return
     }
-    // restartRequired (515) acontece logo depois de ler o QR: reconecta na hora, sem avisar queda.
-    if (code === DisconnectCode.restartRequired) {
+    // restartRequired (515) acontece logo depois de ler o QR: reconecta na hora, sem contar como queda.
+    // Aceita o 515 pelo statusCode, pelos attrs do stream:error (err.data) ou pela mensagem; e um 428 que chega
+    // logo após o pareamento (antes do primeiro open) também é o restart pós-QR.
+    if (this._isRestartRequired(err, code)) {
+      this.justPaired = false
+      logger.info({ sessionId: this.sessionId, code, reason, syncFullHistory: this.socketSyncFullHistory() }, 'Restart pós-QR (515): reconectando na hora')
       this._scheduleReconnect(0)
       return
     }
@@ -672,6 +688,14 @@ class BaileysClient extends EventEmitter {
     const delay = Math.min(1000 * (2 ** Math.min(this.reconnectAttempts - 1, 5)), MAX_RECONNECT_DELAY_MS)
     logger.warn({ sessionId: this.sessionId, code, reason, delay, attempt: this.reconnectAttempts, syncFullHistory: this.lastSocketSyncFullHistory }, 'Conexão Baileys fechada; reconectando')
     this._scheduleReconnect(delay)
+  }
+
+  _isRestartRequired (err, code) {
+    if (code === DisconnectCode.restartRequired) return true
+    const attrCode = Number(err?.data?.attrs?.code ?? err?.data?.code)
+    if (attrCode === DisconnectCode.restartRequired) return true
+    if (/restart required/i.test(String(err?.message || ''))) return true
+    return this.justPaired && !this.connectedOnce && code === DisconnectCode.connectionClosed
   }
 
   _scheduleReconnect (delay) {
@@ -1304,8 +1328,8 @@ class BaileysClient extends EventEmitter {
 
   /** flag true mantém syncFullHistory; false desliga nas próximas conexões sem apagar o que já chegou. */
   async setBackgroundSync (flag) {
+    // Liga/desliga syncFullHistory nas próximas conexões (perfil continua Chrome sem a env explícita).
     this.backgroundSync = flag !== false && flag !== 'false'
-    this.options.syncFullHistory = this.backgroundSync
     return this.backgroundSync
   }
 
