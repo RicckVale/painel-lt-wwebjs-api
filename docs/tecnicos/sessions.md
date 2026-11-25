@@ -58,11 +58,17 @@ No boot, sobe as pastas `baileys-*` com `creds.json` registrado. Pastas `session
 
 ## Sincronização de histórico
 
-- O socket sobe com `shouldSyncHistoryMessage: () => true` e `Browsers.macOS('Desktop')`, o nível mais completo de baileys.wiki advanced/history-sync.
-- `syncFullHistory` depende do pareamento (`client.socketSyncFullHistory()`):
-  - **Sem pareamento** (primeira conexão, sem `creds.me`/`creds.registered` e sem conexão aberta antes): `false`, para o QR sair. Com `true` e browser `Desktop`, o Baileys se anuncia como app nativo (`webSubPlatform` DARWIN/WIN32) e o WhatsApp fecha com 428 "Connection Terminated" antes do QR.
-  - **Pareada**, a partir da reconexão 515 logo depois de ler o QR: segue `BAILEYS_SYNC_FULL_HISTORY` (padrão `true`) ou o último `setBackgroundSync`.
-  - Efeito colateral: o pedido de histórico completo (`requireFullSync`) só vai no registro do aparelho, então o pareamento pede o histórico padrão. O mais antigo chega pelo `syncHistory` sob demanda.
+- **Padrão: histórico sob demanda.** Todo socket sobe com `syncFullHistory: false`, antes e depois do pareamento, e com o perfil de cliente web `Browsers.macOS('Chrome')`, que é o padrão da doc do Baileys (socket-config) e anuncia `webSubPlatform` WEB_BROWSER.
+- `shouldSyncHistoryMessage: () => true`: INITIAL_BOOTSTRAP, RECENT, ON_DEMAND e demais tipos são processados e trazem também o mapa LID → telefone.
+- O histórico completo só liga com `BAILEYS_SYNC_FULL_HISTORY=true` explícito (ou `setBackgroundSync(true)`) **e** sessão já pareada (`client.socketSyncFullHistory()`). O perfil `Browsers.macOS('Desktop')` só volta com a env explícita em `true`.
+- **Por que não é mais o padrão:** com `syncFullHistory: true` + `Desktop`, o Baileys se anuncia como app nativo (`webSubPlatform` DARWIN/WIN32).
+  - Em 25/11, a primeira conexão caía com 428 antes do QR.
+  - Depois, já com a primeira conexão sem histórico completo, o QR era lido e o 515 chegava, mas a **reconexão pós-QR** subia pareada com `syncFullHistory: true` + Desktop. O WhatsApp fechava com 428 "Connection Terminated" em loop e a sessão nunca chegava a `ready`.
+- **Restart pós-QR (515):** reconecta na hora, sem contar como queda e sem ligar o histórico completo. É reconhecido por:
+  - `statusCode` 515
+  - `attrs.code` 515 no `stream:error` (`err.data`)
+  - mensagem "restart required"
+  - 428 que chega logo depois do `creds.update` com `me` (QR lido) e antes do primeiro `open`
 - No QR, o Baileys preenche `creds.me`; `creds.registered` só vira `true` no código de pareamento. Por isso `isRegistered()` considera os dois.
 - `messaging-history.set` entra numa fila assíncrona por sessão (blocos de 200 com `setImmediate`) e grava no store do `fetchMessages`, com upsert por id.
 - Webhook só para id novo e só até `BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS` (900 s), porque o ingest trata webhook como ao vivo (chatbot e notificação). O histórico antigo chega ao CRM pelo `fetchMessages`.
@@ -70,7 +76,7 @@ No boot, sobe as pastas `baileys-*` com `creds.json` registrado. Pastas `session
   - sucesso: `{ success, syncType, progress, isLatest }`
   - sem mensagem guardada: `history_sync_waiting_initial`
   - desconectado: 422 `history_sync_not_connected`
-- `POST /client/setBackgroundSync/:sessionId { flag }` **existe e não é 501**. Ele só liga (`true`) ou desliga (`false`) o `syncFullHistory` das próximas conexões da sessão pareada, sem apagar o store.
+- `POST /client/setBackgroundSync/:sessionId { flag }` **existe e não é 501**. Ele só liga (`true`) ou desliga (`false`) o `syncFullHistory` das próximas conexões da sessão pareada, sem apagar o store. O padrão é desligado. Ligado por esta rota, o perfil continua Chrome (Desktop só com a env). O pedido automático de histórico antigo a partir do `fetchMessages` também segue esta flag; o `syncHistory` explícito do CRM funciona sempre.
 
 ## Reconexão
 
@@ -104,6 +110,7 @@ O mapeamento acontece em `utils.sendErrorResponse`: a message `not_supported_by_
 
 ## Histórico de Modificações Recentes
 
+- Conexão não completava depois do QR (428 em loop na reconexão pós-515 com `syncFullHistory` + Desktop). O padrão passou a ser histórico sob demanda: `syncFullHistory` false, perfil `macOS('Chrome')` e restart 515 robusto. Ver `../2026/11/semana-48/24112026_implementacao_baileys.md` (seção "Correção 2")
 - QR não saía em produção (428 antes do QR): primeira conexão sem `syncFullHistory`, `setBackgroundSync` fora da lista 501 e `reason` no log de queda. Ver `../2026/11/semana-48/24112026_implementacao_baileys.md` (seção "Correção 25/11")
 - Sincronização de histórico completa (messaging-history.set) e syncHistory sob demanda: `../2026/11/semana-48/24112026_implementacao_baileys.md` (seção "Complemento")
 - Troca do motor whatsapp-web.js/Chrome por Baileys, start 202 sem `pupPage`, QR novo obrigatório e rotas 501: `../2026/11/semana-48/24112026_implementacao_baileys.md`

@@ -279,3 +279,59 @@ As reconexões da sessão pareada usam `syncFullHistory: true` com `Mac OS/Deskt
    - socket com credencial pareada nasce com `true`
    - o bloco de histórico completo continua valendo para a sessão pareada
 2. Em produção, depois do deploy e do restart (feitos pelo maestro): `GET /session/start/<id>`, e em poucos segundos `GET /session/qr/<id>` deve responder `{ success: true, qr }`. O log não deve ter 428 antes do QR.
+
+## Correção 2 (25/11/2026): conexão não completava depois do QR. Padrão passa a ser histórico sob demanda
+
+### Sintoma
+
+Produção no commit e7bd2fe, sessão `f28787ad-…`:
+
+1. O QR saiu e foi lido.
+2. Chegou o `stream:error` code 515 (restart pós-QR, normal).
+3. Em seguida, loop de code 428 "Connection Terminated" com `syncFullHistory: true` e backoff de 1s a 30s, nas tentativas 1 a 9.
+4. A sessão nunca chegou a `authenticated`/`ready`.
+
+### Causa
+
+A correção anterior desligava o histórico completo só **antes** do pareamento. Ao ler o QR, o Baileys grava `creds.me`, então `isRegistered()` passa a ser true. Por isso o socket da reconexão pós-515 já subia com `syncFullHistory: true` + `Browsers.macOS('Desktop')`.
+
+Essa combinação faz o login se anunciar como app nativo (`webSubPlatform` DARWIN), e o WhatsApp fecha com 428. O 428 pós-QR vinha dessa reconexão com `syncFullHistory: true`, e não do 515 em si.
+
+### Decisão do dono
+
+Se o histórico avançado atrapalha a conexão, sai. O que precisa funcionar é o histórico sob demanda.
+
+### Ajuste
+
+- `BAILEYS_SYNC_FULL_HISTORY` passa a ter padrão `false` (`src/config.js`, `.env.example`). Todo socket sobe com `syncFullHistory: false`, antes e depois do pareamento.
+  - Com a env explícita em `true` e sessão pareada, o histórico completo liga.
+  - `setBackgroundSync(true)` também liga nas próximas conexões.
+  - O store não é apagado.
+- O perfil passa a ser `Browsers.macOS('Chrome')`, padrão de cliente web na página socket-config do Baileys, cujo exemplo de produção usa `macOS('Chrome')` com `syncFullHistory: false`. `Desktop` só volta com a env explícita em `true`.
+- O restart 515 reconecta na hora, sem contar queda e sem ligar o histórico completo. É reconhecido por:
+  - `statusCode` 515
+  - `attrs.code` do `stream:error`
+  - mensagem "restart required"
+  - 428 logo após o `creds.update` com `me` e antes do primeiro `open`
+- O histórico sob demanda continua igual:
+  - `shouldSyncHistoryMessage: () => true` (INITIAL_BOOTSTRAP, RECENT, ON_DEMAND…)
+  - `messaging-history.set` grava no store com upsert
+  - `/chat/syncHistory` e `/client/syncHistory` chamam `fetchMessageHistory(count|50, chave da mais antiga, messageTimestamp)`
+  - webhook só para id novo dentro de `BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS`
+  - o CRM não mudou
+- O pedido automático de histórico antigo, disparado pelo `fetchMessages`, segue a flag de background sync, que agora começa desligada. O `syncHistory` explícito do CRM funciona sempre.
+
+### Como conferir
+
+1. `npm test` → 48 testes verdes. Os novos provam que:
+   - socket sem parear e socket pareado nascem com `syncFullHistory: false` e perfil Chrome com a env padrão
+   - com a opção `true` e sessão pareada, o socket nasce com `true` e Desktop; com a opção `true` e sem parear, nasce com `false`
+   - fechamento 515 (por `statusCode` ou só pelos attrs do `stream:error`) reconecta em menos de 500 ms, sem contar tentativa e com `syncFullHistory: false`
+   - 428 logo após o pareamento também reconecta na hora
+   - `setBackgroundSync(true)` liga o histórico completo para a próxima conexão
+   - `POST /chat/syncHistory` segue chamando `fetchMessageHistory`
+2. Teste real com o Baileys, credencial nova e pasta temporária: QR em cerca de 1,5 s com `syncFullHistory: false` e perfil Chrome, em 2 de 2 tentativas. Não dá para testar a leitura do QR aqui, porque precisa do celular.
+3. Em produção, depois do deploy e do restart (feitos pelo maestro), confira que `BAILEYS_SYNC_FULL_HISTORY` **não** está em `true` no `.env`. Depois:
+   - `GET /session/start/<id>` e em seguida `GET /session/qr/<id>`
+   - ler o QR
+   - o log deve mostrar `Restart pós-QR (515): reconectando na hora` com `syncFullHistory: false`, seguido de `authenticated`/`ready`, sem loop de 428
