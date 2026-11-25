@@ -355,3 +355,23 @@ Nada de schema. Contrato novo: webhook `dataType: history_ready`. O CRM (reposit
 ### Validação
 
 `npx jest --runInBand tests/baileys.test.js` — 46 testes verdes, incluindo a espera do on-demand, o único `history_ready` e a foto mockada nos três formatos de id.
+
+## Subida da conversa (25/11/2026)
+
+### Problema
+
+No grupo, só a mensagem mais nova aparecia. Ao subir, o celular não devolvia o que estava acima: a chave do `fetchMessageHistory` saía da primeira mensagem da lista, e a resposta ON_DEMAND de grupo às vezes chega com outro JID (`@s.whatsapp.net` ou `@lid`). O waiter de 15 s não casava e o CRM marcava a conversa como parada.
+
+### O que mudou
+
+- `BaileysClient.syncHistory` escolhe a mensagem de menor `messageTimestamp` daquele chat. A chave leva `remoteJid`, `id` e `fromMe`. Em grupo, inclui `participant` quando a mensagem tem.
+- O waiter ON_DEMAND resolve o mesmo chat se o JID da resposta tiver o mesmo usuário (`@g.us`, `@lid` ou `@s.whatsapp.net`). A mensagem entra no store desse chat. Se chegar depois do timeout, a próxima subida já a encontra.
+- `syncFullHistory` continua desligado. O pedido em segundo plano (`_requestOlderHistory`) segue sem rodar quando o histórico completo está desligado. O scroll usa o `POST /chat/syncHistory`.
+
+### API e banco
+
+Nada de schema. `syncHistory` pode responder `{ success: true, syncType: 'ON_DEMAND', pending: true }` quando o celular ainda não devolveu o bloco.
+
+### Validação
+
+`npx jest --runInBand tests/baileys.test.js` — 48 testes verdes. A lista da mais nova para a mais antiga pede a chave da mais antiga, com `participant`. O ON_DEMAND com JID equivalente de grupo entra no store, inclusive o que chega depois do timeout.

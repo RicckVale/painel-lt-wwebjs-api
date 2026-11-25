@@ -28,6 +28,8 @@ const historySyncTypeName = (value) => {
   return HISTORY_SYNC_TYPES[value] || String(value)
 }
 const HISTORY_CHUNK = 200
+// Resposta ON_DEMAND pode chegar depois do timeout; ainda entra no chat que pediu.
+const ON_DEMAND_ALIAS_MS = 120_000
 const yieldLoop = () => new Promise((resolve) => setImmediate(resolve))
 
 class HistorySyncError extends Error {
@@ -479,6 +481,7 @@ class BaileysClient extends EventEmitter {
     this.historyState = { syncType: null, progress: null, isLatest: null, chunks: 0, messages: 0, at: null }
     this.historyStatus = {}
     this.onDemandWaiters = []
+    this.recentOnDemand = []
     // Histórico completo só com BAILEYS_SYNC_FULL_HISTORY=true explícito (options.syncFullHistory === true).
     // setBackgroundSync pode ligar/desligar nas próximas conexões; o padrão é histórico sob demanda.
     this.backgroundSync = options.syncFullHistory === true
@@ -811,19 +814,29 @@ class BaileysClient extends EventEmitter {
     }
     const fresh = []
     const chatJids = new Set()
+    const typeName = historySyncTypeName(syncType)
     for (let i = 0; i < (messages || []).length; i++) {
       if (i && i % HISTORY_CHUNK === 0) await yieldLoop()
-      const raw = messages[i]
+      let raw = messages[i]
       if (!raw?.key?.id || !raw.key.remoteJid || raw.key.remoteJid === 'status@broadcast') continue
-      chatJids.add(this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt))
-      const known = !!this.store.getMessage(this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt), raw.key.id)
+      const incomingChat = this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt)
+      chatJids.add(incomingChat)
+      if (typeName === 'ON_DEMAND') {
+        const target = this._onDemandTarget(raw.key.remoteJid)
+        if (target && target !== incomingChat) {
+          raw = { ...raw, key: { ...raw.key, remoteJid: toBaileysJid(target) } }
+          chatJids.add(target)
+        }
+      }
+      const storedChat = this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt)
+      chatJids.add(storedChat)
+      const known = !!this.store.getMessage(storedChat, raw.key.id)
       this.store.upsertMessage(raw)
       if (known) continue
       const ckey = contentKey(unwrapContent(raw.message))
       if (!ckey || ckey === 'protocolMessage' || ckey === 'reactionMessage') continue
       fresh.push(raw)
     }
-    const typeName = historySyncTypeName(syncType)
     this.historyState = {
       syncType: typeName,
       progress: progress ?? null,
@@ -895,7 +908,7 @@ class BaileysClient extends EventEmitter {
     const { peerDataRequestSessionId, chatIds } = result
     const pending = this.onDemandWaiters.filter((w) => !w.done)
     const match = (peerDataRequestSessionId && pending.find((w) => w.requestId === peerDataRequestSessionId)) ||
-      pending.find((w) => chatIds.has(w.chatId)) ||
+      pending.find((w) => this._sameOnDemandChat(w.chatId, chatIds)) ||
       (!chatIds.size ? pending[0] : null)
     if (match) match.resolve(result)
   }
@@ -1057,6 +1070,36 @@ class BaileysClient extends EventEmitter {
     this.groupCache.set(jid, { meta, at: Date.now() })
     if (meta?.subject) this.store.upsertChat(jid, { name: meta.subject })
     return meta
+  }
+
+  _rememberOnDemand (chatId) {
+    const digits = phoneDigits(chatId)
+    if (!digits) return
+    const now = Date.now()
+    this.recentOnDemand = this.recentOnDemand.filter((row) => now - row.at < ON_DEMAND_ALIAS_MS)
+    this.recentOnDemand.push({ chatId, digits, at: now })
+  }
+
+  _onDemandTarget (remoteJid) {
+    const digits = phoneDigits(remoteJid)
+    if (!digits) return null
+    const now = Date.now()
+    for (let i = this.recentOnDemand.length - 1; i >= 0; i--) {
+      const row = this.recentOnDemand[i]
+      if (now - row.at >= ON_DEMAND_ALIAS_MS) continue
+      if (row.digits === digits) return row.chatId
+    }
+    return null
+  }
+
+  _sameOnDemandChat (chatId, chatIds) {
+    if (chatIds.has(chatId)) return true
+    const digits = phoneDigits(chatId)
+    if (!digits) return false
+    for (const id of chatIds) {
+      if (phoneDigits(id) === digits) return true
+    }
+    return false
   }
 
   _requestOlderHistory (chatId) {
@@ -1327,11 +1370,17 @@ class BaileysClient extends EventEmitter {
     }
     const count = Number(options.count) > 0 ? Math.floor(Number(options.count)) : 50
     const canonical = this.store.canonicalChatId(toBaileysJid(chatId))
-    const oldest = this.store.listMessages(canonical).find((m) => m?.key?.id && m.key.remoteJid)
+    const withKey = this.store.listMessages(canonical).filter((m) => m?.key?.id && m.key.remoteJid)
+    let oldest = null
+    for (const message of withKey) {
+      if (!oldest || toNumber(message.messageTimestamp) < toNumber(oldest.messageTimestamp)) oldest = message
+    }
     if (!oldest) {
       return { success: true, message: 'history_sync_waiting_initial' }
     }
     const key = { remoteJid: oldest.key.remoteJid, id: oldest.key.id, fromMe: !!oldest.key.fromMe }
+    if (oldest.key.participant) key.participant = oldest.key.participant
+    this._rememberOnDemand(canonical)
     const timeoutMs = Number(options.timeoutMs ?? this.options.historyOnDemandTimeoutMs ?? 15000)
     const waiter = this._waitOnDemand(canonical, timeoutMs)
     let requestId

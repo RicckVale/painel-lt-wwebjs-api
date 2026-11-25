@@ -72,8 +72,9 @@ No boot, sobe as pastas `baileys-*` com `creds.json` registrado. Pastas `session
 - No QR, o Baileys preenche `creds.me`; `creds.registered` só vira `true` no código de pareamento. Por isso `isRegistered()` considera os dois.
 - `messaging-history.set` entra numa fila assíncrona por sessão (blocos de 200 com `setImmediate`) e grava no store do `fetchMessages`, com upsert por id.
 - Webhook `message` só para id novo e só até `BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS` (900 s), porque o ingest trata esse webhook como ao vivo. A janela vale só para essa mensagem ao vivo. Quando `INITIAL_BOOTSTRAP`, `RECENT` ou `FULL` termina com `isLatest: true`, sai um único webhook `history_ready` com `{ syncType, isLatest: true, chats, messages }` (contagens do bloco). O CRM sincroniza por esse evento, com `historical: true`.
-- `POST /chat/syncHistory` e `POST /client/syncHistory` (`controllers/historySync.js`) chamam `fetchMessageHistory(count|50, chave da mais antiga, messageTimestamp)` e esperam a resposta ON_DEMAND por até 15 s. As respostas possíveis:
+- `POST /chat/syncHistory` e `POST /client/syncHistory` (`controllers/historySync.js`) chamam `fetchMessageHistory(count|50, chave da mensagem de menor messageTimestamp, messageTimestamp)` e esperam a resposta ON_DEMAND por até 15 s. A chave tem `remoteJid`, `id`, `fromMe` e, em grupo, `participant` quando existe. O waiter casa `@g.us`, `@lid` e `@s.whatsapp.net` do mesmo usuário. Resposta que chega depois do timeout entra no store desse chat. As respostas possíveis:
   - sucesso: `{ success, syncType, progress, isLatest }`
+  - pedido aceito e resposta ainda não chegou: `{ success: true, syncType: 'ON_DEMAND', pending: true }`
   - sem mensagem guardada: `history_sync_waiting_initial`
   - desconectado: 422 `history_sync_not_connected`
 - `POST /client/setBackgroundSync/:sessionId { flag }` **existe e não é 501**. Ele só liga (`true`) ou desliga (`false`) o `syncFullHistory` das próximas conexões da sessão pareada, sem apagar o store. O padrão é desligado. Ligado por esta rota, o perfil continua Chrome (Desktop só com a env).
@@ -111,6 +112,7 @@ O mapeamento acontece em `utils.sendErrorResponse`: a message `not_supported_by_
 
 ## Histórico de Modificações Recentes
 
+- Subida da conversa: a chave do `fetchMessageHistory` é a mensagem mais antiga, e o ON_DEMAND de grupo casa JID equivalente (inclusive depois do timeout). Ver `../2026/11/semana-48/24112026_implementacao_baileys.md` (seção "Subida da conversa")
 - Inbox ao conectar: `fetchMessages` espera o histórico sob demanda, e o fim de `INITIAL_BOOTSTRAP`/`RECENT`/`FULL` emite um único `history_ready`. Ver `../2026/11/semana-48/24112026_implementacao_baileys.md` (seção "Inbox ao conectar")
 - Conexão não completava depois do QR (428 em loop na reconexão pós-515 com `syncFullHistory` + Desktop). O padrão passou a ser histórico sob demanda: `syncFullHistory` false, perfil `macOS('Chrome')` e restart 515 robusto. Ver `../2026/11/semana-48/24112026_implementacao_baileys.md` (seção "Correção 2")
 - QR não saía em produção (428 antes do QR): primeira conexão sem `syncFullHistory`, `setBackgroundSync` fora da lista 501 e `reason` no log de queda. Ver `../2026/11/semana-48/24112026_implementacao_baileys.md` (seção "Correção 25/11")

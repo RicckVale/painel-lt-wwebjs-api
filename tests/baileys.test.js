@@ -703,6 +703,88 @@ describe('Sincronização de histórico (messaging-history.set e fetchMessageHis
     expect(mockWebhookCalls.some((c) => c.body.data?.message?.id?.id === 'BOOT-END')).toBe(false)
   })
 
+  it('syncHistory pede a mensagem mais antiga mesmo se a lista chegou da mais nova para a mais antiga, e o ON_DEMAND de grupo entra no mesmo chat', async () => {
+    await request(app).get('/session/start/sessao-grp').set(KEY).expect(202)
+    const sock = await socketOf('sessao-grp')
+    sock.ev.emit('connection.update', { connection: 'open' })
+    const stamp = now()
+    const group = '120363000000000099@g.us'
+    const newest = {
+      key: { remoteJid: group, fromMe: false, id: 'G-NEW', participant: '5511999000111@s.whatsapp.net' },
+      messageTimestamp: stamp,
+      message: { conversation: 'nova' }
+    }
+    const oldest = {
+      key: { remoteJid: group, fromMe: true, id: 'G-OLD', participant: '5511999000222@s.whatsapp.net' },
+      messageTimestamp: stamp - 5000,
+      message: { conversation: 'velha' }
+    }
+    sock.ev.emit('messaging-history.set', {
+      chats: [{ id: group, conversationTimestamp: stamp }],
+      contacts: [],
+      messages: [newest, oldest],
+      syncType: 2,
+      isLatest: false
+    })
+    await sessions.get('sessao-grp').historyQueue
+
+    sock.fetchMessageHistory.mockImplementationOnce(async () => {
+      setImmediate(() => sock.ev.emit('messaging-history.set', {
+        chats: [],
+        contacts: [],
+        messages: [{
+          key: { remoteJid: '120363000000000099@s.whatsapp.net', fromMe: false, id: 'G-OLDER', participant: '5511999000333@s.whatsapp.net' },
+          messageTimestamp: stamp - 9000,
+          message: { conversation: 'antes' }
+        }],
+        syncType: 6,
+        progress: 100,
+        isLatest: true,
+        peerDataRequestSessionId: 'outro-id'
+      }))
+      return undefined
+    })
+    const res = await request(app).post('/chat/syncHistory/sessao-grp').set(KEY).send({ chatId: group, count: 20 })
+    expect(res.status).toBe(200)
+    expect(res.body.pending).toBeUndefined()
+    expect(sock.fetchMessageHistory).toHaveBeenCalledWith(
+      20,
+      { remoteJid: group, id: 'G-OLD', fromMe: true, participant: '5511999000222@s.whatsapp.net' },
+      stamp - 5000
+    )
+    const fetched = await request(app).post('/chat/fetchMessages/sessao-grp').set(KEY).send({ chatId: group, searchOptions: { limit: 10 } })
+    expect(fetched.body.messages.map((m) => m.id.id)).toEqual(['G-OLDER', 'G-OLD', 'G-NEW'])
+  })
+
+  it('ON_DEMAND que chega depois do timeout fica no store do mesmo grupo', async () => {
+    const sock = await socketOf('sessao-grp')
+    const stamp = now()
+    const group = '120363000000000099@g.us'
+    sock.fetchMessageHistory.mockImplementationOnce(async () => {
+      setTimeout(() => sock.ev.emit('messaging-history.set', {
+        chats: [],
+        contacts: [],
+        messages: [{
+          key: { remoteJid: '120363000000000099@lid', fromMe: false, id: 'G-LATE', participant: '5511999000444@s.whatsapp.net' },
+          messageTimestamp: stamp - 20000,
+          message: { conversation: 'atrasada' }
+        }],
+        syncType: 6,
+        isLatest: true,
+        peerDataRequestSessionId: 'g-late'
+      }), 400)
+      return undefined
+    })
+    const res = await request(app).post('/chat/syncHistory/sessao-grp').set(KEY).send({ chatId: group, count: 20 })
+    expect(res.status).toBe(200)
+    expect(res.body.pending).toBe(true)
+    await new Promise((resolve) => setTimeout(resolve, 500))
+    await sessions.get('sessao-grp').historyQueue
+    const fetched = await request(app).post('/chat/fetchMessages/sessao-grp').set(KEY).send({ chatId: group, searchOptions: { limit: 10 } })
+    expect(fetched.status).toBe(200)
+    expect(fetched.body.messages.map((m) => m.id.id)).toContain('G-LATE')
+  })
+
   it('setBackgroundSync: false desliga nas próximas conexões sem apagar o store; true volta', async () => {
     const client = sessions.get('sessao-h')
     await request(app).post('/client/setBackgroundSync/sessao-h').set(KEY).send({ flag: false }).expect(200)
