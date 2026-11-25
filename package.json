@@ -1,7 +1,7 @@
 {
   "name": "wwebjs-api",
   "version": "1.0.0",
-  "description": "REST API wrapper for whatsapp-web.js",
+  "description": "REST API do WhatsApp não oficial do Floume (motor Baileys, sem Chrome)",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -19,11 +19,9 @@
     "qr-image": "^3.2.0",
     "qrcode-terminal": "^0.12.0",
     "swagger-ui-express": "^5.0.1",
-    "whatsapp-web.js": "github:wwebjs/whatsapp-web.js#f935b500117e264c2b3abc25b63a280bd98182a7",
     "ws": "^8.20.0"
   },
   "overrides": {
-    "@puppeteer/browsers": "3.2.6",
     "basic-ftp": "^6.2.6",
     "deepmerge": "4.1.2",
     "glob": "^14.0.4",
@@ -42,7 +40,7 @@
   },
   "keywords": [
     "whatsapp",
-    "whatsapp-web",
+    "baileys",
     "wwebjs",
     "api",
     "wrapper",
