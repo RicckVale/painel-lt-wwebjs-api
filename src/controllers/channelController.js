@@ -1,4 +1,4 @@
-const { MessageMedia } = require('whatsapp-web.js')
+const { MessageMedia } = require('../baileys/structures')
 const { sessions } = require('../sessions')
 const { sendErrorResponse } = require('../utils')
 

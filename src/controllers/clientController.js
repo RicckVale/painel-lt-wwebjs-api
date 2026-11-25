@@ -1,6 +1,6 @@
-const { MessageMedia, Location, Poll } = require('whatsapp-web.js')
+const { MessageMedia, Location, Poll } = require('../baileys/structures')
 const { sessions } = require('../sessions')
-const { sendErrorResponse } = require('../utils')
+const { sendErrorResponse, sendNotSupported } = require('../utils')
 
 /**
  * Send a message to a chat using the WhatsApp API
@@ -2227,17 +2227,8 @@ const runMethod = async (req, res) => {
       },
     }
   */
-  try {
-    const { method, options } = req.body
-    const client = sessions.get(req.params.sessionId)
-    if (typeof client[method] !== 'function') {
-      throw new Error('Method is not implemented')
-    }
-    const result = options ? await client[method](options) : await client[method]()
-    res.json({ success: true, data: result })
-  } catch (error) {
-    sendErrorResponse(res, 500, error.message)
-  }
+  // run-method continua bloqueado: no Baileys não há objeto do WhatsApp Web para invocar método arbitrário.
+  return sendNotSupported(res)
 }
 
 module.exports = {

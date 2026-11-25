@@ -1,6 +1,6 @@
 const qr = require('qr-image')
 const { setupSession, deleteSession, reloadSession, validateSession, flushSessions, destroySession, sessions } = require('../sessions')
-const { sendErrorResponse, waitForNestedObject, exposeFunctionIfAbsent } = require('../utils')
+const { sendErrorResponse, sendNotSupported } = require('../utils')
 const { logger } = require('../logger')
 
 /**
@@ -21,6 +21,14 @@ const startSession = async (req, res) => {
   try {
     const setupSessionReturn = await setupSession(sessionId)
     if (!setupSessionReturn.success) {
+      if (setupSessionReturn.alreadyExists) {
+        // Sessão já em memória: conectada → 200; subindo/aguardando QR → 202 (o CRM segue consultando status/QR).
+        const validation = await validateSession(sessionId)
+        if (validation.success) {
+          return res.json({ success: true, message: 'session_already_connected' })
+        }
+        return res.status(202).json({ success: true, message: 'session_initialization_in_progress' })
+      }
       /* #swagger.responses[422] = {
         description: "Unprocessable Entity.",
         content: {
@@ -33,8 +41,8 @@ const startSession = async (req, res) => {
       sendErrorResponse(res, 422, setupSessionReturn.message)
       return
     }
-    /* #swagger.responses[200] = {
-      description: "Status of the initiated session.",
+    /* #swagger.responses[202] = {
+      description: "Session initialization started in background (Baileys). Poll /session/status and /session/qr.",
       content: {
         "application/json": {
           schema: { "$ref": "#/definitions/StartSessionResponse" }
@@ -42,13 +50,8 @@ const startSession = async (req, res) => {
       }
     }
     */
-    // wait until the client is created
-    await waitForNestedObject(setupSessionReturn.client, 'pupPage')
-    const payload = { success: true, message: setupSessionReturn.message }
-    if (setupSessionReturn.sessionDataReset) {
-      payload.sessionDataReset = true
-    }
-    res.json(payload)
+    // Não espera conexão nem QR: o QR chega pelo connection.update do Baileys e fica em sessions.get(id).qr
+    res.status(202).json({ success: true, message: 'session_initialization_started' })
   } catch (error) {
     logger.error({ sessionId, err: error }, 'Failed to start session')
     sendErrorResponse(res, 500, error.message)
@@ -368,18 +371,16 @@ const requestPairingCode = async (req, res) => {
     }
   */
   try {
-    const { phoneNumber, showNotification = true } = req.body
+    const { phoneNumber } = req.body || {}
+    if (!phoneNumber || !String(phoneNumber).replace(/\D/g, '')) {
+      return sendErrorResponse(res, 400, 'phoneNumber is required')
+    }
     const client = sessions.get(req.params.sessionId)
     if (!client) {
       return res.json({ success: false, message: 'session_not_found' })
     }
-    // hotfix https://github.com/pedroslopez/whatsapp-web.js/pull/3706
-    await exposeFunctionIfAbsent(client.pupPage, 'onCodeReceivedEvent', async (code) => {
-      client.emit('code', code)
-      return code
-    })
-    const result = await client.requestPairingCode(phoneNumber, showNotification)
-    res.json({ success: true, result })
+    const result = await client.requestPairingCode(String(phoneNumber))
+    res.json({ success: true, result, pairingCode: result })
   } catch (error) {
     sendErrorResponse(res, 500, error.message)
   }
@@ -410,7 +411,7 @@ const getSessions = async (req, res) => {
 }
 
 /**
- * Get pupPage screenshot image
+ * Get page screenshot image (não existe no Baileys: responde 501 not_supported_by_baileys)
  *
  * @function
  * @async
@@ -422,39 +423,8 @@ const getSessions = async (req, res) => {
 const getPageScreenshot = async (req, res) => {
   // #swagger.summary = 'Get page screenshot'
   // #swagger.description = 'Screenshot of the client with the given session ID.'
-  const sessionId = req.params.sessionId
-  try {
-    const session = sessions.get(sessionId)
-    if (!session) {
-      return res.json({ success: false, message: 'session_not_found' })
-    }
-
-    if (!session.pupPage) {
-      return res.json({ success: false, message: 'page_not_ready' })
-    }
-
-    const pngBase64String = await session.pupPage.screenshot({
-      fullPage: true,
-      encoding: 'base64',
-      type: 'png'
-    })
-
-    /* #swagger.responses[200] = {
-        description: "Screenshot image.",
-        content: {
-          "image/png": {}
-        }
-      }
-    */
-    res.writeHead(200, {
-      'Content-Type': 'image/png'
-    })
-    res.write(Buffer.from(pngBase64String, 'base64'))
-    res.end()
-  } catch (error) {
-    logger.error({ sessionId, err: error }, 'Failed to get page screenshot')
-    sendErrorResponse(res, 500, error.message)
-  }
+  // Baileys não usa navegador: não existe página para capturar.
+  return sendNotSupported(res)
 }
 
 module.exports = {

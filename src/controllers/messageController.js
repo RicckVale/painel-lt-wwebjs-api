@@ -1,7 +1,7 @@
-const { MessageMedia, Location, Poll } = require('whatsapp-web.js')
+const { MessageMedia, Location, Poll } = require('../baileys/structures')
 const { Readable } = require('stream')
 const { sessions } = require('../sessions')
-const { sendErrorResponse, decodeBase64 } = require('../utils')
+const { sendErrorResponse, decodeBase64, sendNotSupported } = require('../utils')
 
 /**
  * Get message by its ID from a given chat using the provided client.
@@ -15,8 +15,10 @@ const { sendErrorResponse, decodeBase64 } = require('../utils')
  */
 const _getMessageById = async (client, messageId, chatId) => {
   const chat = await client.getChatById(chatId)
-  const messages = await chat.fetchMessages({ messageId: messageId, limit: 1 })
-  return messages[0]
+  const messages = chat ? await chat.fetchMessages({ messageId, limit: 1 }) : []
+  if (messages[0]) return messages[0]
+  // chatId pode vir como @lid ou @c.us conforme a origem: procura o id em todo o store da sessão
+  return client.findMessageById(messageId)
 }
 
 /**
@@ -528,8 +530,6 @@ const reply = async (req, res) => {
       }
       case 'Poll': {
         contentMessage = new Poll(content.pollName, content.pollOptions, content.options)
-        // fix for poll events not being triggered (open the chat that you sent the poll)
-        await client.interface.openChatWindow(chatId)
         break
       }
       default:
@@ -813,19 +813,8 @@ const runMethod = async (req, res) => {
       },
     }
   */
-  try {
-    const { messageId, chatId, method, options } = req.body
-    const client = sessions.get(req.params.sessionId)
-    const message = await _getMessageById(client, messageId, chatId)
-    if (!message) { throw new Error('Message not found') }
-    if (typeof message[method] !== 'function') {
-      throw new Error('Method is not implemented')
-    }
-    const result = options ? await message[method](options) : await message[method]()
-    res.json({ success: true, data: result })
-  } catch (error) {
-    sendErrorResponse(res, 500, error.message)
-  }
+  // run-method continua bloqueado: no Baileys não há objeto do WhatsApp Web para invocar método arbitrário.
+  return sendNotSupported(res)
 }
 
 module.exports = {

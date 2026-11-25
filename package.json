@@ -9,6 +9,7 @@
     "swagger": "node swagger.js"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "7.0.0-rc14",
     "axios": "^1.15.2",
     "cors": "^2.8.6",
     "dotenv": "^16.6.1",

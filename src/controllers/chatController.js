@@ -1,5 +1,5 @@
 const { sessions } = require('../sessions')
-const { sendErrorResponse } = require('../utils')
+const { sendErrorResponse, sendNotSupported } = require('../utils')
 
 /**
  * @function
@@ -490,22 +490,8 @@ const runMethod = async (req, res) => {
       },
     }
   */
-  try {
-    const { chatId, method, options } = req.body
-    const client = sessions.get(req.params.sessionId)
-    const chat = await client.getChatById(chatId)
-    if (!chat) {
-      sendErrorResponse(res, 404, 'Chat not Found')
-      return
-    }
-    if (typeof chat[method] !== 'function') {
-      throw new Error('Method is not implemented')
-    }
-    const result = options ? await chat[method](options) : await chat[method]()
-    res.json({ success: true, data: result })
-  } catch (error) {
-    sendErrorResponse(res, 500, error.message)
-  }
+  // run-method continua bloqueado: no Baileys não há objeto do WhatsApp Web para invocar método arbitrário.
+  return sendNotSupported(res)
 }
 
 module.exports = {

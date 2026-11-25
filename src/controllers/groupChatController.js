@@ -1,6 +1,6 @@
-const { MessageMedia } = require('whatsapp-web.js')
+const { MessageMedia } = require('../baileys/structures')
 const { sessions } = require('../sessions')
-const { sendErrorResponse } = require('../utils')
+const { sendErrorResponse, sendNotSupported } = require('../utils')
 
 /**
  * Retrieves information about a chat based on the provided chatId
@@ -722,19 +722,8 @@ const runMethod = async (req, res) => {
       },
     }
   */
-  try {
-    const { chatId, method, options } = req.body
-    const client = sessions.get(req.params.sessionId)
-    const chat = await client.getChatById(chatId)
-    if (!chat.isGroup) { throw new Error('The chat is not a group') }
-    if (typeof chat[method] !== 'function') {
-      throw new Error('Method is not implemented')
-    }
-    const result = options ? await chat[method](options) : await chat[method]()
-    res.json({ success: true, data: result })
-  } catch (error) {
-    sendErrorResponse(res, 500, error.message)
-  }
+  // run-method continua bloqueado: no Baileys não há objeto do WhatsApp Web para invocar método arbitrário.
+  return sendNotSupported(res)
 }
 
 module.exports = {

@@ -10,12 +10,8 @@ process.env.BASE_WEBHOOK_URL = 'http://localhost:3000/localCallbackExample'
 const app = require('../src/app')
 jest.mock('qrcode-terminal')
 
-jest.setTimeout(5 * 60 * 1000)
-
-let server
 beforeAll(() => {
   fs.rmSync(process.env.SESSIONS_PATH, { recursive: true, force: true })
-  server = app.listen(3000)
 })
 
 beforeEach(() => {
@@ -25,7 +21,6 @@ beforeEach(() => {
 })
 
 afterAll(() => {
-  server.close()
   fs.rmSync(process.env.SESSIONS_PATH, { recursive: true, force: true })
 })
 
@@ -62,90 +57,12 @@ describe('API Authentication Tests', () => {
     expect(response.body).toEqual({ success: false, error: 'Session should be alphanumerical or -' })
   })
 
-  it('should setup and terminate a client session', async () => {
-    const response = await request(app).get('/session/start/1').set('x-api-key', 'test_api_key')
-    expect(response.status).toBe(200)
-    expect(response.body).toEqual({ success: true, message: 'Session initiated successfully' })
-    expect(fs.existsSync('./sessions_test/session-1')).toBe(true)
-
-    const response2 = await request(app).get('/session/terminate/1').set('x-api-key', 'test_api_key')
-    expect(response2.status).toBe(200)
-    expect(response2.body).toEqual({ success: true, message: 'Logged out successfully' })
-
-    expect(fs.existsSync('./sessions_test/session-1')).toBe(false)
-  })
-
-  it('should setup and flush multiple client sessions', async () => {
-    const response = await request(app).get('/session/start/2').set('x-api-key', 'test_api_key')
-    expect(response.status).toBe(200)
-    expect(response.body).toEqual({ success: true, message: 'Session initiated successfully' })
-    expect(fs.existsSync('./sessions_test/session-2')).toBe(true)
-
-    const response2 = await request(app).get('/session/start/3').set('x-api-key', 'test_api_key')
-    expect(response2.status).toBe(200)
-    expect(response2.body).toEqual({ success: true, message: 'Session initiated successfully' })
-    expect(fs.existsSync('./sessions_test/session-3')).toBe(true)
-
-    const response3 = await request(app).get('/session/terminateInactive').set('x-api-key', 'test_api_key')
-    expect(response3.status).toBe(200)
-    expect(response3.body).toEqual({ success: true, message: 'Flush completed successfully' })
-
-    expect(fs.existsSync('./sessions_test/session-2')).toBe(false)
-    expect(fs.existsSync('./sessions_test/session-3')).toBe(false)
+  it('should return session_not_found for unknown session status and qr', async () => {
+    const status = await request(app).get('/session/status/nao-existe').set('x-api-key', 'test_api_key')
+    expect(status.body).toEqual({ success: false, state: null, message: 'session_not_found' })
+    const qr = await request(app).get('/session/qr/nao-existe').set('x-api-key', 'test_api_key')
+    expect(qr.body).toEqual({ success: false, message: 'session_not_found' })
   })
 })
 
-describe('API Action Tests', () => {
-  it('should setup, create at least a QR, and terminate a client session', async () => {
-    const response = await request(app).get('/session/start/4').set('x-api-key', 'test_api_key')
-    expect(response.status).toBe(200)
-    expect(response.body).toEqual({ success: true, message: 'Session initiated successfully' })
-    expect(fs.existsSync('./sessions_test/session-4')).toBe(true)
-
-    // Wait for message_log.txt to not be empty
-    const result = await waitForFileNotToBeEmpty('./sessions_test/message_log.txt', 120_000, 1000)
-      .then(() => { return true })
-      .catch(() => { return false })
-    expect(result).toBe(true)
-
-    // Verify the message content
-    const expectedMessage = {
-      dataType: 'qr',
-      data: expect.objectContaining({ qr: expect.any(String) }),
-      sessionId: '4'
-    }
-    expect(JSON.parse(fs.readFileSync('./sessions_test/message_log.txt', 'utf-8'))).toEqual(expectedMessage)
-
-    const response2 = await request(app).get('/session/terminate/4').set('x-api-key', 'test_api_key')
-    expect(response2.status).toBe(200)
-    expect(response2.body).toEqual({ success: true, message: 'Logged out successfully' })
-    expect(fs.existsSync('./sessions_test/session-4')).toBe(false)
-  })
-})
-
-// Function to wait for a specific item to be equal a specific value
-const waitForFileNotToBeEmpty = (filePath, maxWaitTime = 10000, interval = 100) => {
-  const start = Date.now()
-  return new Promise((resolve, reject) => {
-    const checkObject = async () => {
-      try {
-        const filecontent = await fs.promises.readFile(filePath, 'utf-8')
-        if (filecontent !== '') {
-        // Nested object exists, resolve the promise
-          resolve()
-        } else if (Date.now() - start > maxWaitTime) {
-        // Maximum wait time exceeded, reject the promise
-          console.log('Timed out waiting for nested object')
-          reject(new Error('Timeout waiting for nested object'))
-        } else {
-        // Nested object not yet created, continue waiting
-          setTimeout(checkObject, interval)
-        }
-      } catch (ignore) {
-        // continue waiting
-        setTimeout(checkObject, interval)
-      }
-    }
-    checkObject()
-  })
-}
+// O fluxo de sessão (start 202, QR, envio, terminate) com socket Baileys mockado fica em tests/baileys.test.js.
