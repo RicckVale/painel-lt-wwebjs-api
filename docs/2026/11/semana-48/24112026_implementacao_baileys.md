@@ -335,3 +335,23 @@ Se o histórico avançado atrapalha a conexão, sai. O que precisa funcionar é 
    - `GET /session/start/<id>` e em seguida `GET /session/qr/<id>`
    - ler o QR
    - o log deve mostrar `Restart pós-QR (515): reconectando na hora` com `syncFullHistory: false`, seguido de `authenticated`/`ready`, sem loop de 428
+
+## Inbox ao conectar (25/11/2026)
+
+### Problema
+
+Com o histórico completo desligado, o inbox conectava e listava poucos previews. `fetchMessages` lia o store e pedia o histórico antigo sem esperar, então a API recebia lista vazia (HTTP 200) e tratava como erro.
+
+### O que mudou
+
+- `BaileysChat.fetchMessages` (`src/baileys/client.js`), quando o store tem menos mensagens que o `limit`, espera o `fetchMessageHistory` até `BAILEYS_HISTORY_ON_DEMAND_TIMEOUT_MS` e só então responde. Sem mensagem antiga para servir de chave, devolve o que já tem, sem 500. Não liga `syncFullHistory` e não volta o perfil Desktop.
+- Quando `messaging-history.set` de `INITIAL_BOOTSTRAP`, `RECENT` ou `FULL` termina com `isLatest: true`, sai um único webhook `history_ready` com `{ syncType, isLatest: true, chats, messages }` (contagens daquele bloco). O disparo está em `src/sessions.js`. Mensagem antiga continua sem webhook `message`. A janela `BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS` segue só para a mensagem ao vivo.
+- `getProfilePicUrl` aceita `@c.us`, `@s.whatsapp.net` e `@lid` (o JID do Baileys).
+
+### API e banco
+
+Nada de schema. Contrato novo: webhook `dataType: history_ready`. O CRM (repositório `api`) consome esse evento.
+
+### Validação
+
+`npx jest --runInBand tests/baileys.test.js` — 46 testes verdes, incluindo a espera do on-demand, o único `history_ready` e a foto mockada nos três formatos de id.

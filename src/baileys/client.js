@@ -230,18 +230,34 @@ class BaileysChat {
   async fetchMessages (searchOptions = {}) {
     const { limit, fromMe, messageId, since } = searchOptions || {}
     const wanted = messageId ? parseMessageId(messageId).id : null
-    let list = this.client.store.listMessages(this.id._serialized)
-    list = list.filter((m) => {
-      const content = unwrapContent(m.message)
-      const ckey = contentKey(content)
-      if (!ckey || ckey === 'protocolMessage' || ckey === 'reactionMessage') return wanted ? m.key.id === wanted : false
-      if (fromMe !== undefined && !!m.key.fromMe !== !!fromMe) return false
-      if (since !== undefined && Number.isFinite(since) && toNumber(m.messageTimestamp) < since) return false
-      if (wanted && m.key.id !== wanted) return false
-      return true
-    })
-    if (limit > 0 && list.length > limit) list = list.slice(list.length - limit)
-    if (!wanted && limit > 0 && list.length < limit) this.client._requestOlderHistory(this.id._serialized)
+    const read = () => {
+      let list = this.client.store.listMessages(this.id._serialized)
+      list = list.filter((m) => {
+        const content = unwrapContent(m.message)
+        const ckey = contentKey(content)
+        if (!ckey || ckey === 'protocolMessage' || ckey === 'reactionMessage') return wanted ? m.key.id === wanted : false
+        if (fromMe !== undefined && !!m.key.fromMe !== !!fromMe) return false
+        if (since !== undefined && Number.isFinite(since) && toNumber(m.messageTimestamp) < since) return false
+        if (wanted && m.key.id !== wanted) return false
+        return true
+      })
+      if (limit > 0 && list.length > limit) list = list.slice(list.length - limit)
+      return list
+    }
+    let list = read()
+    // Store curto: espera o celular (fetchMessageHistory) até o timeout e só então responde.
+    // Sem mensagem antiga para servir de chave, devolve o que já tem — sem 500.
+    if (!wanted && limit > 0 && list.length < limit) {
+      try {
+        await this.client.syncHistory(this.id._serialized, {
+          count: limit,
+          timeoutMs: this.client.options.historyOnDemandTimeoutMs
+        })
+      } catch (err) {
+        logger.warn({ sessionId: this.client.sessionId, chatId: this.id._serialized, err: err?.message }, 'fetchMessages sem histórico extra')
+      }
+      list = read()
+    }
     return list.map((m) => new BaileysMessage(this.client, m))
   }
 
@@ -820,6 +836,14 @@ class BaileysClient extends EventEmitter {
       this._resolveOnDemand({ peerDataRequestSessionId, chatIds: chatJids, syncType: typeName, progress: progress ?? null, isLatest: isLatest ?? null, received: fresh.length })
     }
     this.emit('history_sync', { syncType: typeName, progress: progress ?? null, isLatest: isLatest ?? null, chats: (chats || []).length, messages: (messages || []).length, fresh: fresh.length })
+    if (isLatest === true && (typeName === 'INITIAL_BOOTSTRAP' || typeName === 'RECENT' || typeName === 'FULL')) {
+      this.emit('history_ready', {
+        syncType: typeName,
+        isLatest: true,
+        chats: (chats || []).length,
+        messages: (messages || []).length
+      })
+    }
     await this._emitHistoryMessages(fresh)
   }
 

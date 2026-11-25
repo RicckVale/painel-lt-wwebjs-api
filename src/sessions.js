@@ -174,6 +174,7 @@ const initializeEvents = (client, sessionId) => {
   forward('message_edit', (message, newBody, prevBody) => ({ message, newBody, prevBody }))
   forward('message_revoke_everyone', (message, revokedMsg) => ({ message, revokedMsg }))
   forward('ready')
+  forward('history_ready', (payload) => payload)
   forward('chat_archived', (payload) => payload)
   forward('unread_count', (payload) => payload)
   forward('code', (code) => ({ code }))

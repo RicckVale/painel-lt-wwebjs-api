@@ -8,6 +8,7 @@ process.env.API_KEY = 'test_api_key'
 process.env.SESSIONS_PATH = './sessions_test_baileys'
 process.env.BASE_WEBHOOK_URL = 'http://webhook.test/webhook/whatsapp'
 process.env.ENABLE_WEBHOOK = 'TRUE'
+process.env.BAILEYS_HISTORY_ON_DEMAND_TIMEOUT_MS = '250'
 
 const mockSockets = []
 
@@ -349,6 +350,18 @@ describe('Sessão Baileys conectada', () => {
     expect(res.body).toEqual({ success: true, result: 'https://pps.whatsapp.net/v/foto.jpg' })
   })
 
+  it('getProfilePicUrl aceita @c.us, @s.whatsapp.net e @lid', async () => {
+    const sock = await socketOf('sessao-a')
+    const ids = ['5511977776666@c.us', '5511977776666@s.whatsapp.net', '7770001112223@lid']
+    for (const contactId of ids) {
+      const res = await request(app).post('/client/getProfilePicUrl/sessao-a').set(KEY).send({ contactId })
+      expect(res.status).toBe(200)
+      expect(res.body).toEqual({ success: true, result: 'https://pps.whatsapp.net/v/foto.jpg' })
+    }
+    const jids = sock.profilePictureUrl.mock.calls.map((call) => call[0])
+    expect(jids).toEqual(expect.arrayContaining(['5511977776666@s.whatsapp.net', '7770001112223@lid']))
+  })
+
   it('rotas sem equivalente no Baileys respondem 501 estável', async () => {
     const shot = await request(app).get('/session/getPageScreenshot/sessao-a').set(KEY)
     expect(shot.status).toBe(501)
@@ -613,6 +626,81 @@ describe('Sincronização de histórico (messaging-history.set e fetchMessageHis
     expect(res.status).toBe(200)
     expect(res.body).toMatchObject({ success: true, syncType: 'ON_DEMAND', progress: 100, isLatest: true, received: 0, count: 50 })
     expect(sock.fetchMessageHistory).toHaveBeenLastCalledWith(50, { remoteJid: chatJid, id: 'HIST-OLDER-0', fromMe: false }, base - 86400)
+  })
+
+  it('fetchMessages espera o on-demand quando o store tem menos que o limit e não estoura sem chave', async () => {
+    await request(app).get('/session/start/sessao-ond').set(KEY).expect(202)
+    const sock = await socketOf('sessao-ond')
+    sock.ev.emit('connection.update', { connection: 'open' })
+    const stamp = now()
+    const ondJid = '5511933334444@s.whatsapp.net'
+    sock.ev.emit('messaging-history.set', {
+      chats: [{ id: ondJid, conversationTimestamp: stamp }],
+      contacts: [],
+      messages: [{ key: { remoteJid: ondJid, fromMe: false, id: 'OND-NEW' }, messageTimestamp: stamp, message: { conversation: 'recente' } }],
+      syncType: 3,
+      isLatest: false
+    })
+    await sessions.get('sessao-ond').historyQueue
+    sock.fetchMessageHistory.mockImplementationOnce(async () => {
+      setImmediate(() => sock.ev.emit('messaging-history.set', {
+        chats: [],
+        contacts: [],
+        messages: [{ key: { remoteJid: ondJid, fromMe: false, id: 'OND-OLD' }, messageTimestamp: stamp - 5000, message: { conversation: 'anterior' } }],
+        syncType: 6,
+        progress: 100,
+        isLatest: true,
+        peerDataRequestSessionId: 'ond-1'
+      }))
+      return 'ond-1'
+    })
+    const res = await request(app).post('/chat/fetchMessages/sessao-ond').set(KEY)
+      .send({ chatId: '5511933334444@c.us', searchOptions: { limit: 10 } })
+    expect(res.status).toBe(200)
+    expect(res.body.messages.map((m) => m.id.id)).toEqual(['OND-OLD', 'OND-NEW'])
+    expect(sock.fetchMessageHistory).toHaveBeenCalledWith(10, { remoteJid: ondJid, id: 'OND-NEW', fromMe: false }, stamp)
+    expect(webhooksOf('history_ready').some((c) => c.body.data?.syncType === 'ON_DEMAND')).toBe(false)
+
+    const empty = await request(app).post('/chat/fetchMessages/sessao-ond').set(KEY)
+      .send({ chatId: '5511900001111@c.us', searchOptions: { limit: 10 } })
+    expect(empty.status).toBe(200)
+    expect(empty.body).toEqual({ success: true, messages: [] })
+  })
+
+  it('INITIAL_BOOTSTRAP com isLatest emite um único history_ready e não um message por mensagem antiga', async () => {
+    const sock = await socketOf('sessao-ond')
+    const beforeReady = webhooksOf('history_ready').length
+    const oldTs = now() - 3 * 86400
+    const ondJid = '5511933334444@s.whatsapp.net'
+    sock.ev.emit('messaging-history.set', {
+      chats: [{ id: ondJid }],
+      contacts: [],
+      messages: [{ key: { remoteJid: ondJid, fromMe: false, id: 'BOOT-OLD' }, messageTimestamp: oldTs, message: { conversation: 'velha' } }],
+      syncType: 0,
+      progress: 40,
+      isLatest: false
+    })
+    await sessions.get('sessao-ond').historyQueue
+    expect(webhooksOf('history_ready').length).toBe(beforeReady)
+    expect(mockWebhookCalls.some((c) => c.body.data?.message?.id?.id === 'BOOT-OLD')).toBe(false)
+
+    sock.ev.emit('messaging-history.set', {
+      chats: [{ id: ondJid }, { id: '5511900002222@s.whatsapp.net' }],
+      contacts: [],
+      messages: [{ key: { remoteJid: ondJid, fromMe: false, id: 'BOOT-END' }, messageTimestamp: oldTs, message: { conversation: 'fim' } }],
+      syncType: 0,
+      progress: 100,
+      isLatest: true
+    })
+    await sessions.get('sessao-ond').historyQueue
+    const ready = webhooksOf('history_ready').slice(beforeReady)
+    expect(ready).toHaveLength(1)
+    expect(ready[0].body).toMatchObject({
+      dataType: 'history_ready',
+      sessionId: 'sessao-ond',
+      data: { syncType: 'INITIAL_BOOTSTRAP', isLatest: true, chats: 2, messages: 1 }
+    })
+    expect(mockWebhookCalls.some((c) => c.body.data?.message?.id?.id === 'BOOT-END')).toBe(false)
   })
 
   it('setBackgroundSync: false desliga nas próximas conexões sem apagar o store; true volta', async () => {
