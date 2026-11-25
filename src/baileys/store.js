@@ -107,8 +107,9 @@ class SessionStore {
     if (chat.unreadCount != null) patch.unreadCount = Math.max(0, chat.unreadCount)
     if (chat.conversationTimestamp != null) patch.timestamp = toNumber(chat.conversationTimestamp)
     if (chat.archived != null) patch.archived = !!chat.archived
-    if (chat.pinned != null) patch.pinned = toNumber(chat.pinned)
-    if (chat.muteEndTime != null) patch.muteEndTime = toNumber(chat.muteEndTime)
+    // pinned/muteEndTime chegam null quando o celular desafixa/reativa o som
+    if ('pinned' in chat) patch.pinned = toNumber(chat.pinned)
+    if ('muteEndTime' in chat) patch.muteEndTime = toNumber(chat.muteEndTime)
     const alt = chat.pnJid || chat.lidJid
     this.upsertChat(chat.id, patch, alt)
   }

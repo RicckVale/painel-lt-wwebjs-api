@@ -223,9 +223,11 @@ class BaileysChat {
 
   async sendSeen () {
     const sock = this.client._sock()
-    const unread = this.client.store.listMessages(this.id._serialized).filter((m) => !m.key.fromMe).slice(-20)
+    const unread = this.client.store.listMessages(this.id._serialized).filter((m) => !m.key.fromMe && !m.readByMe).slice(-20)
     if (unread.length) {
       await sock.readMessages(unread.map((m) => m.key))
+      for (const m of unread) m.readByMe = true
+      this.client.store.scheduleSave()
     }
     this.client.store.upsertChat(this.jid, { unreadCount: 0 })
     return true
@@ -425,6 +427,7 @@ class BaileysClient extends EventEmitter {
     this.numberIdCache = new Map()
     this.groupCache = new Map()
     this.historyRequests = new Map()
+    this.pendingOwnSends = new Set()
     this.baileysVersion = null
     this.interface = {
       openChatWindow: async () => { throw new NotSupportedError('interface.openChatWindow') },
@@ -702,7 +705,12 @@ class BaileysClient extends EventEmitter {
     for (const u of updates || []) {
       const before = this.store.getChat(toWwebjsId(u.id))
       const prevArchived = before ? !!before.archived : false
-      const prevUnread = before ? before.unreadCount : 0
+      const prevUnread = before ? (before.unreadCount || 0) : 0
+      // No chats.update do Baileys, unreadCount > 0 é incremento (mensagem nova); -1 = marcado como não lido.
+      if (typeof u.unreadCount === 'number') {
+        if (u.unreadCount > 0) u.unreadCount = prevUnread + u.unreadCount
+        else if (u.unreadCount < 0) u.unreadCount = Math.max(prevUnread, 1)
+      }
       this.store.applyBaileysChat(u)
       const after = this.store.getChat(toWwebjsId(u.id))
       if (!after) continue
@@ -723,7 +731,10 @@ class BaileysClient extends EventEmitter {
       if (raw.key.remoteJid === 'status@broadcast') continue
       const content = unwrapContent(raw.message)
       const ckey = contentKey(content)
-      const isNew = !this.store.getMessage(this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt), raw.key.id)
+      const known = !!this.store.getMessage(this.store.canonicalChatId(raw.key.remoteJid, raw.key.remoteJidAlt), raw.key.id)
+      // Enviada pela API: já está no store (_wrapSent), mas o message_create ainda precisa sair uma vez.
+      const sentByApi = this.pendingOwnSends.delete(raw.key.id)
+      const isNew = !known || sentByApi
 
       if (ckey === 'protocolMessage') {
         this._onProtocolMessage(raw, content.protocolMessage)
@@ -746,9 +757,6 @@ class BaileysClient extends EventEmitter {
       }
       const msg = new BaileysMessage(this, raw)
       if (!raw.key.fromMe && (type === 'notify' || type === 'append')) {
-        const chatId = msg.id.remote
-        const chat = this.store.chats.get(chatId)
-        if (chat && type === 'notify') this.store.upsertChat(toBaileysJid(chatId), { unreadCount: (chat.unreadCount || 0) + 1 })
         this.emit('message', msg)
       }
       this.emit('message_create', msg)
@@ -888,6 +896,10 @@ class BaileysClient extends EventEmitter {
 
   _wrapSent (sent) {
     if (!sent) return null
+    if (sent.key?.id) {
+      this.pendingOwnSends.add(sent.key.id)
+      if (this.pendingOwnSends.size > 1000) this.pendingOwnSends.delete(this.pendingOwnSends.values().next().value)
+    }
     this.store.upsertMessage(sent)
     return new BaileysMessage(this, sent)
   }
@@ -1022,6 +1034,9 @@ class BaileysClient extends EventEmitter {
   async getNumberId (number) {
     const digits = phoneDigits(number)
     if (!digits) return null
+    // Número que na verdade é um LID já mapeado: devolve o telefone (forma que o Floume conhece)
+    const knownPn = this.store.pnForLid(`${digits}@lid`)
+    if (knownPn) return toWid(knownPn)
     const cached = this.numberIdCache.get(digits)
     if (cached && Date.now() < cached.expiresAt) return cached.value
     const res = await this._sock().onWhatsApp(digits)

@@ -229,6 +229,74 @@ describe('Sessão Baileys conectada', () => {
     expect(hook.body.data.message.id.id).toBe('3EB0AAA111')
   })
 
+  it('envio pela API gera um único message_create quando o Baileys ecoa a mensagem', async () => {
+    const sock = await socketOf('sessao-a')
+    const res = await request(app).post('/client/sendMessage/sessao-a').set(KEY)
+      .send({ chatId: '5511966665555@c.us', contentType: 'string', content: 'eco' })
+    const sentId = res.body.message.id.id
+    const echo = { key: { remoteJid: '5511966665555@s.whatsapp.net', fromMe: true, id: sentId }, message: { conversation: 'eco' }, messageTimestamp: 1732400050 }
+    sock.ev.emit('messages.upsert', { type: 'append', messages: [echo] })
+    sock.ev.emit('messages.upsert', { type: 'append', messages: [echo] })
+    const creates = webhooksOf('message_create').filter((c) => c.body.data.message.id.id === sentId)
+    expect(creates).toHaveLength(1)
+    expect(creates[0].body.data.message.fromMe).toBe(true)
+    expect(creates[0].body.data.message.from).toBe('5511900000000@c.us')
+    expect(webhooksOf('message').some((c) => c.body.data.message.id.id === sentId)).toBe(false)
+  })
+
+  it('mensagem de LID com telefone alternativo chega com from @c.us', async () => {
+    const sock = await socketOf('sessao-a')
+    sock.ev.emit('messages.upsert', {
+      type: 'notify',
+      messages: [{
+        key: { remoteJid: '123456789012345@lid', remoteJidAlt: '5511944443333@s.whatsapp.net', fromMe: false, id: 'LIDMSG1' },
+        messageTimestamp: 1732400200,
+        message: { extendedTextMessage: { text: 'oi via lid' } }
+      }]
+    })
+    const msg = (await waitFor(() => webhooksOf('message').find((c) => c.body.data.message.id.id === 'LIDMSG1'))).body.data.message
+    expect(msg.from).toBe('5511944443333@c.us')
+    expect(msg._data.id.remote).toBe('5511944443333@c.us')
+    expect(msg.body).toBe('oi via lid')
+
+    const lid = await request(app).post('/client/getContactLidAndPhone/sessao-a').set(KEY).send({ userIds: ['123456789012345@lid'] })
+    expect(lid.body).toEqual({ success: true, data: [{ lid: '123456789012345@lid', pn: '5511944443333@c.us' }] })
+  })
+
+  it('mensagem de grupo traz author do participante', async () => {
+    const sock = await socketOf('sessao-a')
+    sock.ev.emit('messages.upsert', {
+      type: 'notify',
+      messages: [{
+        key: { remoteJid: '120363000000000001@g.us', participant: '5511933332222@s.whatsapp.net', fromMe: false, id: 'GRP1' },
+        pushName: 'Membro',
+        messageTimestamp: 1732400300,
+        message: { imageMessage: { caption: 'olha', mimetype: 'image/jpeg', fileLength: 1234, mediaKey: Buffer.from('k') } }
+      }]
+    })
+    const msg = (await waitFor(() => webhooksOf('message').find((c) => c.body.data.message.id.id === 'GRP1'))).body.data.message
+    expect(msg.from).toBe('120363000000000001@g.us')
+    expect(msg.author).toBe('5511933332222@c.us')
+    expect(msg.id._serialized).toBe('false_120363000000000001@g.us_GRP1_5511933332222@c.us')
+    expect(msg.type).toBe('image')
+    expect(msg.hasMedia).toBe(true)
+    expect(msg._data.body).toBe('olha')
+    expect(msg.message.imageMessage.mediaKey).toBeUndefined()
+    const media = await waitFor(() => webhooksOf('media').find((c) => c.body.data.message.id.id === 'GRP1'))
+    expect(media.body.data.messageMedia).toEqual({ mimetype: 'image/jpeg', data: Buffer.from('conteudo-do-arquivo').toString('base64'), filename: null, filesize: 19 })
+  })
+
+  it('unreadCount do chats.update é incremento e dispara unread_count', async () => {
+    const sock = await socketOf('sessao-a')
+    sock.ev.emit('chats.update', [{ id: '5511977776666@s.whatsapp.net', unreadCount: 1 }])
+    sock.ev.emit('chats.update', [{ id: '5511977776666@s.whatsapp.net', unreadCount: 2 }])
+    const hook = webhooksOf('unread_count').pop()
+    expect(hook.body.data.chatId).toBe('5511977776666@c.us')
+    expect(hook.body.data.unreadCount).toBe(3)
+    sock.ev.emit('chats.update', [{ id: '5511977776666@s.whatsapp.net', unreadCount: 0 }])
+    expect(webhooksOf('unread_count').pop().body.data.unreadCount).toBe(0)
+  })
+
   it('getChats e fetchMessages leem o store da sessão', async () => {
     const chats = await request(app).get('/client/getChats/sessao-a').set(KEY)
     expect(chats.body.success).toBe(true)
