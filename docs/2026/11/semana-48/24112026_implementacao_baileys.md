@@ -110,7 +110,7 @@ Novas variáveis (opcionais):
 
 - `BAILEYS_LOG_LEVEL` (padrão `warn`)
 - `BAILEYS_FETCH_LATEST_VERSION` (padrão `true`)
-- `BAILEYS_SYNC_FULL_HISTORY` (padrão `false`)
+- `BAILEYS_SYNC_FULL_HISTORY` (padrão `true` desde o complemento de histórico abaixo)
 
 Saíram as variáveis do Chrome/Puppeteer: `CHROME_BIN`, `HEADLESS`, `WEB_VERSION*`, `RECOVER_SESSIONS`, `RELEASE_BROWSER_LOCK`, `CLIENT_INITIALIZE_*`, `PUPPETEER_PROTOCOL_TIMEOUT_MS` e `WIPE_SESSION_DATA_AFTER_INIT_FAILURE`.
 
@@ -150,5 +150,85 @@ No boot, o processo registra um aviso com a quantidade de pastas `session-*` ign
 ## Pendências conhecidas
 
 - Etiquetas (labels do WhatsApp Business) e canais ainda respondem 501.
-- `fetchMessages` lê o store local: mensagens recebidas desde o pareamento, mais o histórico recente que o WhatsApp manda no pareamento. Pedido acima do que existe no store dispara `fetchMessageHistory` em segundo plano, no máximo uma vez a cada 10 min por chat. O resultado aparece numa próxima chamada.
-- `getChats` só conhece chats vistos desde o pareamento ou vindos do histórico. O store persiste em `floume-store.json` para sobreviver a restart.
+- `fetchMessages` lê o store local: o histórico que o celular manda (completo, ver abaixo) mais o que chegou ao vivo. Fica limitado a `BAILEYS_STORE_MAX_MESSAGES_PER_CHAT` mensagens por chat em memória e `BAILEYS_STORE_PERSIST_MESSAGES_PER_CHAT` no `floume-store.json`. Pedido acima do que existe no store dispara `fetchMessageHistory` em segundo plano, no máximo uma vez a cada 10 min por chat.
+- Unidade do timestamp no `fetchMessageHistory`: passamos o `messageTimestamp` em segundos, como no exemplo do Baileys e no pedido. O campo do protocolo se chama `oldestMsgTimestampMs`. Se em produção o celular não devolver nada, essa é a primeira coisa a conferir.
+
+## Complemento (25/11/2026): sincronização de histórico
+
+Referência: https://baileys.wiki/pt-BR/advanced/history-sync. A versão em inglês detalha mais. O nível mais completo da página é:
+
+- `browser: Browsers.macOS('Desktop')`, porque o perfil Chrome padrão limita o histórico que o WhatsApp devolve no pareamento
+- `syncFullHistory: true`
+- guardar as mensagens (também usadas pelo `getMessage`)
+- paginar com `sock.fetchMessageHistory(count, oldestMsgKey, oldestMsgTimestamp)`
+
+### Socket
+
+- `syncFullHistory: true`, que fica `false` só se `BAILEYS_SYNC_FULL_HISTORY=false` ou depois de `setBackgroundSync` com flag `false`.
+- `shouldSyncHistoryMessage: () => true`. Nenhum tipo é descartado: INITIAL_BOOTSTRAP, INITIAL_STATUS_V3, FULL, RECENT, PUSH_NAME, NON_BLOCKING_DATA e ON_DEMAND.
+- `browser: Browsers.macOS('Desktop')`. No celular, o aparelho vinculado aparece como Mac/Desktop.
+- Também é escutado `messaging-history.status` (complete/paused por tipo). O estado fica em `client.getHistorySyncState()`.
+
+### `messaging-history.set`
+
+- O handler do socket só enfileira e devolve na hora. Uma fila por sessão (`historyQueue`) processa em blocos de 200 com `setImmediate` entre eles, para não travar o event loop.
+- Grava `lidPnMappings`, contatos, chats e mensagens no mesmo store que `fetchMessages`, `getChats` e `downloadMedia` leem, com upsert por id. Payload repetido não duplica.
+- Guarda `syncType` (nome), `progress` e `isLatest` do último bloco recebido.
+- Webhook (`message` para recebida, `message_create` para enviada) **só para id novo** e só se a mensagem tiver até `BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS`. O padrão é 900 s; `0` desliga e `-1` tira o limite. A URL continua vindo só do ambiente.
+- **Por que a janela de idade:** o `wwebjs-ingest` trata todo webhook `message` como mensagem ao vivo (`historical: false`). Isso aciona chatbot, notificação em tempo real e lead scoring. Mandar o histórico inteiro por webhook faria o bot responder conversas de meses atrás.
+- O histórico antigo chega ao CRM pelo caminho que já existe: `syncHistoryForChat` → `syncMessagesForChat` → `fetchMessages`.
+- O formato do id não muda: `@c.us` quando o telefone é conhecido, `@lid` quando não é, e `@g.us` para grupo. A conversão para JID do Baileys acontece na borda.
+
+### `POST /chat/syncHistory/:sessionId` e `POST /client/syncHistory/:sessionId`
+
+As duas rotas seguem o mesmo caminho (`src/controllers/historySync.js`). Saiu o `sessionValidation` dessas rotas, para o controller poder responder 422 em vez de 404 quando a sessão está desconectada.
+
+- **Body:** `{ chatId, count? }`. `count` vale se for número positivo; senão 50.
+- **Chave:** a mensagem mais antiga já guardada do chat, `{ remoteJid (JID original do Baileys), id, fromMe }`, e o `messageTimestamp` dela.
+- **Respostas:**
+
+  | Situação | Status | Corpo |
+  | --- | --- | --- |
+  | sem mensagem guardada | `200` | `{ success: true, message: 'history_sync_waiting_initial' }` |
+  | socket desconectado | `422` | `{ success: false, error: 'history_sync_not_connected', message: 'history_sync_not_connected' }` |
+  | sessão inexistente | `404` | `session_not_found` |
+  | resposta chegou | `200` | `{ success: true, syncType: 'ON_DEMAND', progress, isLatest, received, requestId, count }` |
+  | celular não respondeu no prazo | `200` | `{ ..., pending: true }` |
+
+- **Espera:** o controller aguarda o `messaging-history.set` com `syncType` ON_DEMAND (casado por `peerDataRequestSessionId` ou pelo chat) até `BAILEYS_HISTORY_ON_DEMAND_TIMEOUT_MS` (15 s, abaixo dos 30 s do HTTP do CRM). Assim, o `fetchMessages` que o CRM chama em seguida já enxerga as mensagens.
+- **Sem resposta no prazo:** o pedido foi aceito e a resposta, quando chegar, vai para o store.
+- O contrato do CRM não mudou: qualquer 2xx é sucesso, e o adapter tenta `/client` se `/chat` falhar.
+
+### `setBackgroundSync`
+
+`POST /client/setBackgroundSync/:sessionId { flag }`:
+
+- `true` mantém o `syncFullHistory`.
+- `false` desliga a partir da próxima conexão e o pedido automático de histórico antigo, sem apagar nada do store.
+
+### Novas variáveis
+
+- `BAILEYS_HISTORY_WEBHOOK_MAX_AGE_SECONDS` (900)
+- `BAILEYS_HISTORY_ON_DEMAND_TIMEOUT_MS` (15000)
+- `BAILEYS_STORE_MAX_MESSAGES_PER_CHAT` (500)
+- `BAILEYS_STORE_PERSIST_MESSAGES_PER_CHAT` (200)
+
+### Como conferir
+
+1. `npm test` → 42 testes verdes. O bloco "Sincronização de histórico" prova:
+   - opções do socket (syncFullHistory, shouldSyncHistoryMessage, perfil macOS)
+   - 2 mensagens + 1 repetida → 2 no `fetchMessages` e um webhook por id
+   - mensagem velha fica no store sem webhook
+   - `@lid` preservado
+   - `/chat/syncHistory` chama `fetchMessageHistory(30, chave mais antiga, timestamp)` e devolve `syncType`/`progress`/`isLatest`
+   - `/client/syncHistory` com `count` inválido usa 50
+   - 422 quando desconectado e `history_sync_waiting_initial` sem mensagem
+   - `setBackgroundSync`
+2. Em produção, depois de ler o QR, os logs devem mostrar o histórico chegando. Testar com:
+
+   ```bash
+   curl -X POST -H "x-api-key: $API_KEY" -H 'Content-Type: application/json' \
+     -d '{"chatId":"55DDDNUMERO@c.us","count":50}' https://crmwwebjs.opsyn.com.br/chat/syncHistory/<instanceId>
+   ```
+
+   A resposta esperada é `{ success: true, syncType: 'ON_DEMAND', progress, isLatest }`. Em seguida, `fetchMessages` do mesmo chat deve trazer as mensagens mais antigas.
